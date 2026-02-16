@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Pic-Time to Cloud Storage Migrator",
+  "version": "0.1.0",
+  "description": "Background orchestrator for migrating authenticated Pic-Time data to Cloud Storage.",
+  "permissions": ["storage", "cookies", "scripting"],
+  "host_permissions": [
+    "https://galleries.pixieset.com/*",
+    "https://images.pixieset.com/*",
+    "https://storage.googleapis.com/*",
+    "https://pixie-set-backend-pxbb63zhgq-uc.a.run.app/*"
+  ],
+  "background": {
+    "service_worker": "dist/background/worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Start migration"
+  }
+}

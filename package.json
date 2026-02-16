@@ -1,0 +1,17 @@
+{
+  "name": "pic-time-migrator",
+  "version": "0.1.0",
+  "description": "Production-ready Chrome Extension scaffold for migrating Pic-Time data to Cloud Storage.",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf dist",
+    "watch": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.212",
+    "rimraf": "^5.0.0",
+    "typescript": "^5.5.2"
+  }
+}
+

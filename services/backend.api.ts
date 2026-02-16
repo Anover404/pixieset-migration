@@ -1,0 +1,201 @@
+import { Logger } from "../background/logger.js";
+import { retryWithBackoff, shouldRetryHttpError } from "../utils/retry.js";
+
+const BACKEND_BASE_URL = "https://pixie-set-backend-pxbb63zhgq-uc.a.run.app";
+
+const AUTH_TOKEN = "test-migration-token";
+
+const logger = new Logger();
+const API_TAG = "[backend-api]";
+
+export type CreateAlbumRequest = {
+  albumName: string;
+  fullMetadata: Record<string, unknown>;
+  domain: string;
+  albumId?: string;
+};
+
+export type CreateAlbumResponse = {
+  success: boolean;
+  albumId?: string;
+  message?: string;
+  error?: string;
+};
+
+export type GetUploadUrlRequest = {
+  filename: string | string[];
+  albumName: string;
+  domain: string;
+  albumId?: string;
+  /** Array of metadata objects, one per filename; each object is x-goog-meta-* header name -> value for signing */
+  metadata?: Array<Record<string, string>>;
+};
+
+export type GetUploadUrlResponse = {
+  ok: boolean;
+  skipped?: boolean;
+  uploadUrl?: string;
+  objectPath?: string;
+  error?: string;
+};
+
+export type GetUploadUrlBatchResponse = GetUploadUrlResponse[];
+
+/** Turn backend error payload (string or object) into a single string for logging/UI */
+function stringifyBackendError(err: unknown): string {
+  if (err == null) return "Unknown error";
+  if (typeof err === "string") return err;
+  if (typeof err === "object" && err !== null && "message" in err && typeof (err as { message: unknown }).message === "string") {
+    return (err as { message: string }).message;
+  }
+  return JSON.stringify(err);
+}
+
+/**
+ * Creates a Pixieset album in the backend
+ * @param albumName - The collection name
+ * @param fullMetadata - The complete JSON response from fetchCollectionDetail
+ * @param domain - The username from the bootstrap/profile
+ * @returns Response from the backend API
+ */
+export async function createPixiesetAlbum(
+  albumName: string,
+  fullMetadata: Record<string, unknown>,
+  domain: string,
+  albumId?: string
+): Promise<CreateAlbumResponse> {
+  const endpoint = "/api/create-pixieset-album";
+  const url = `${BACKEND_BASE_URL}${endpoint}`;
+  
+  try {
+    const response = await retryWithBackoff(
+      async () => {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            authorization: AUTH_TOKEN
+          },
+          body: JSON.stringify({
+            albumName,
+            fullMetadata,
+            domain,
+            ...(albumId && { albumId })
+          })
+        });
+
+        if (!res.ok) {
+          const errorData = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+          const errorMessage = errorData.message as string ?? `HTTP ${res.status}: ${res.statusText}`;
+          throw { status: res.status, statusText: res.statusText, errorMessage, errorData };
+        }
+
+        return res;
+      },
+      3, // maxRetries
+      1000, // initialDelayMs
+      shouldRetryHttpError
+    );
+
+    const data = (await response.json()) as CreateAlbumResponse;
+    return {
+      ...data,
+      success: data.success ?? true
+    };
+  } catch (error) {
+    const errorMessage = (error && typeof error === 'object' && 'errorMessage' in error)
+      ? (error as { errorMessage: string }).errorMessage
+      : (error instanceof Error ? error.message : "Unknown error occurred");
+    
+    logger.error(`${API_TAG} API call exception: ${endpoint} - ${errorMessage}`, {
+      endpoint,
+      url,
+      error: error instanceof Error ? error.stack : String(error)
+    });
+    return {
+      success: false,
+      error: errorMessage
+    };
+  }
+}
+
+/**
+ * Gets a presigned upload URL for uploading an image to GCP
+ * @param filename - The filename of the image (or array of filenames for batch)
+ * @param albumName - The album/collection name
+ * @param domain - The username/domain
+ * @param metadata - Optional array of metadata objects, one per filename (x-goog-meta-* headers for signing)
+ * @returns Response with upload URL or skip status (or array of responses for batch)
+ */
+export async function getPixiesetUploadUrl(
+  filename: string | string[],
+  albumName: string,
+  domain: string,
+  albumId?: string,
+  metadata?: Array<Record<string, string>>
+): Promise<GetUploadUrlResponse | GetUploadUrlBatchResponse> {
+  const endpoint = "/api/get-pixieset-upload-url";
+  const url = `${BACKEND_BASE_URL}${endpoint}`;
+  const isBatch = Array.isArray(filename);
+  
+  try {
+    const response = await retryWithBackoff(
+      async () => {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            authorization: AUTH_TOKEN
+          },
+          body: JSON.stringify({
+            filename,
+            albumName,
+            domain,
+            ...(albumId && { albumId }),
+            ...(metadata != null && metadata.length > 0 && { metadata })
+          })
+        });
+
+        if (!res.ok) {
+          const errorData = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+          const errorMessage = stringifyBackendError(errorData.error ?? errorData.message ?? `HTTP ${res.status}: ${res.statusText}`);
+          throw { status: res.status, statusText: res.statusText, errorMessage, errorData };
+        }
+
+        return res;
+      },
+      3, // maxRetries
+      1000, // initialDelayMs
+      shouldRetryHttpError
+    );
+
+    const data = await response.json();
+    
+    // If batch request, return array; otherwise return single response
+    if (isBatch) {
+      return data as GetUploadUrlBatchResponse;
+    }
+    
+    return data as GetUploadUrlResponse;
+  } catch (error) {
+    const errorMessage = (error && typeof error === "object" && "errorMessage" in error)
+      ? (error as { errorMessage: unknown }).errorMessage
+      : (error instanceof Error ? error.message : "Unknown error occurred");
+    const errorStr = typeof errorMessage === "string" ? errorMessage : stringifyBackendError(errorMessage);
+
+    logger.error(`${API_TAG} API call exception: ${endpoint} - ${errorStr}`, {
+      endpoint,
+      url,
+      error: error instanceof Error ? error.stack : errorStr,
+      filename: isBatch ? `${filename.length} files` : filename,
+      albumName
+    });
+
+    if (isBatch) {
+      return filename.map(() => ({ ok: false, error: errorStr }));
+    }
+    return { ok: false, error: errorStr };
+  }
+}

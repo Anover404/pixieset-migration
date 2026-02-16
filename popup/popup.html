@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Migration Control</title>
+    <link rel="stylesheet" href="popup.css" />
+    <script type="module" src="../dist/popup/popup.js"></script>
+  </head>
+  <body>
+    <main class="main-wrapper">
+      <div class="hero">
+        <p class="eyebrow">Pixieset Migrator</p>
+        <h1>Pixieset Migration</h1>
+        <p class="subhead">Choose how you want to move your galleries to the new workspace.</p>
+        <div id="heroLogin" class="hero-login hidden">
+          <button id="heroLoginBtn" class="ghost">Log in to Pixieset</button>
+        </div>
+      </div>
+      <p id="status">Checking login status…</p>
+      <p id="userInfo" class="muted"></p>
+      <p id="totalCount" class="muted"></p>
+      <p id="progressInfo" class="muted"></p>
+      <div id="loginView" class="panel hidden">
+        <p>Please log into Pixieset to continue.</p>
+      </div>
+      <div id="startView" class="panel hidden">
+        <div id="migrationSummary" class="migration-summary hidden">
+          <div class="summary-header">
+            <p class="eyebrow">Migration Summary</p>
+            <button id="summaryExpand" class="summary-expand" aria-label="View detailed summary" title="View detailed summary">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M6 4L10 8L6 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+          <div class="summary-grid">
+            <div class="summary-item">
+              <span class="summary-label">Collections</span>
+              <span class="summary-value" id="summaryCollections">0</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label">Galleries</span>
+              <span class="summary-value" id="summaryGalleries">0</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label">Images</span>
+              <span class="summary-value" id="summaryImages">0</span>
+            </div>
+            <div class="summary-item">
+              <span class="summary-label">Time Taken</span>
+              <span class="summary-value" id="summaryTime">-</span>
+            </div>
+          </div>
+        </div>
+        <div id="summaryDetailModal" class="modal hidden">
+          <div class="modal-content summary-detail-content">
+            <div class="modal-header">
+              <div>
+                <p class="eyebrow">Detailed Summary</p>
+                <h2>Migration Details</h2>
+              </div>
+              <div class="modal-header-actions">
+                <button id="summaryDownload" class="summary-download" aria-label="Download summary" title="Download summary as JSON">
+                  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M17.5 12.5V15.8333C17.5 16.2754 17.3244 16.6993 17.0118 17.0118C16.6993 17.3244 16.2754 17.5 15.8333 17.5H4.16667C3.72464 17.5 3.30072 17.3244 2.98816 17.0118C2.67559 16.6993 2.5 16.2754 2.5 15.8333V12.5M13.3333 8.33333L10 11.6667M10 11.6667L6.66667 8.33333M10 11.6667V2.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+                <button id="summaryModalClose" class="modal-close" aria-label="Close modal">×</button>
+              </div>
+            </div>
+            <div id="summaryDetailContent" class="summary-detail-body">
+              <!-- Content will be populated by JavaScript -->
+            </div>
+          </div>
+        </div>
+        <div class="concurrency-setting">
+          <label for="concurrencyFactor" class="concurrency-label">
+            <span>Upload Concurrency</span>
+            <span class="concurrency-hint">Number of photos to upload simultaneously</span>
+          </label>
+          <input 
+            type="number" 
+            id="concurrencyFactor" 
+            class="concurrency-input" 
+            min="1" 
+            max="20" 
+            value="3"
+            aria-label="Concurrency factor for parallel uploads"
+          />
+        </div>
+        <div class="migrate-types-setting">
+          <span class="concurrency-label">Migrate</span>
+          <div class="migrate-types-options">
+            <label class="checkbox-label">
+              <input type="checkbox" id="includeImages" checked aria-label="Include images" />
+              <span>Images</span>
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" id="includeVideos" aria-label="Include videos" />
+              <span>Videos</span>
+            </label>
+          </div>
+        </div>
+        <div class="actions" id="mainActions">
+          <button id="migrateAll" class="primary">Migrate All</button>
+          <button id="selectCollections" class="secondary">Migrate Specific Collections</button>
+        </div>
+      </div>
+      <div id="progressView" class="panel hidden">
+        <p class="eyebrow">Migration in progress</p>
+        <div id="migrationLoader" class="loader">
+          <div class="loader-content">
+            <div class="spinner"></div>
+            <div class="loader-percent" id="loaderPercent">0%</div>
+            <div class="loader-message" id="loaderCollection">Waiting...</div>
+          </div>
+        </div>
+        <p class="muted" id="progressInfo">Preparing migration…</p>
+        <div class="actions" id="activeActions">
+          <button id="pause" class="secondary ghost">Pause</button>
+          <button id="resume" class="primary hidden">Resume</button>
+        </div>
+      </div>
+      <div id="selectionModal" class="modal hidden">
+        <div class="modal-content modal-content--selection">
+          <div class="modal-header modal-header--minimal">
+            <button id="modalClose" class="modal-close" aria-label="Close modal">×</button>
+          </div>
+          <div id="rangeSelection" class="range-selection">
+            <span class="range-label">Range:</span>
+            <div class="range-controls">
+              <label class="range-field">
+                <span>From</span>
+                <input type="number" id="rangeStart" min="1" placeholder="1" aria-label="Start index" />
+              </label>
+              <label class="range-field">
+                <span>To</span>
+                <input type="number" id="rangeEnd" min="1" placeholder="1" aria-label="End index" />
+              </label>
+              <button type="button" id="selectRangeBtn" class="secondary ghost">Select range</button>
+            </div>
+            <span id="rangeHint" class="muted range-hint"></span>
+          </div>
+          <p id="modalStatus">Loading collections…</p>
+          <div id="modalList" class="collection-list"></div>
+          <div class="pagination modal-pagination">
+            <button id="modalPrev" class="ghost" disabled>Prev</button>
+            <span id="modalPageInfo">1 / 1</span>
+            <button id="modalNext" class="ghost" disabled>Next</button>
+          </div>
+          <button id="modalConfirm" class="primary" disabled>Start migrating selected</button>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>
+
