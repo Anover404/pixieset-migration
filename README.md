@@ -31,7 +31,12 @@ Chrome extension that migrates authenticated **Pixieset / Pic-Time** gallery dat
    npm install
    ```
 
-3. **Build the extension:**
+3. **Update backend config:** In `services/backend.api.ts`, set your backend URL and auth token:
+   - `BACKEND_BASE_URL` — your Cloud Run (or other) backend base URL
+   - `AUTH_TOKEN` — the token used to authenticate requests to the backend  
+   Replace the default values before building/running the extension.
+
+4. **Build the extension:**
    ```bash
    npm run build
    ```
