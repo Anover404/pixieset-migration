@@ -261,18 +261,7 @@ export type GalleryDetail = {
       path_xxlarge: string;
       [key: string]: unknown;
     }>;
-    videos?: Array<{
-      id: number;
-      name: string;
-      video_source: string;
-      width?: number;
-      height?: number;
-      provider_id?: number;
-      mux_status?: number;
-      metadata?: string;
-      thumbnail_path?: string;
-      poster_path?: string;
-    }>;
+    videos?: unknown[];
   };
 };
 

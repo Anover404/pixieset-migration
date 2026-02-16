@@ -514,40 +514,6 @@ button.secondary {
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
 }
 
-.migrate-types-setting {
-  margin-top: 12px;
-  padding: 16px;
-  background: rgba(148, 163, 184, 0.05);
-  border-radius: 8px;
-  border: 1px solid rgba(148, 163, 184, 0.1);
-}
-
-.migrate-types-setting .concurrency-label {
-  margin-bottom: 10px;
-}
-
-.migrate-types-options {
-  display: flex;
-  gap: 20px;
-  flex-wrap: wrap;
-}
-
-.checkbox-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.875rem;
-  color: #e2e8f0;
-  cursor: pointer;
-}
-
-.checkbox-label input[type="checkbox"] {
-  width: 18px;
-  height: 18px;
-  accent-color: #6366f1;
-  cursor: pointer;
-}
-
 .summary-detail-content {
   max-width: 600px;
   max-height: 80vh;

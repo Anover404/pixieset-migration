@@ -11,7 +11,7 @@ import {
 import { createPixiesetAlbum, getPixiesetUploadUrl, GetUploadUrlResponse } from "../services/backend.api.js";
 import { sleep } from "../utils/sleep.js";
 import { retryWithBackoff, shouldRetryHttpError } from "../utils/retry.js";
-import { PauseState, FailedImage, CollectionFailureInfo, MigrationSummary, PixiesetPhoto, PixiesetVideo } from "./models.js";
+import { PauseState, FailedImage, CollectionFailureInfo, MigrationSummary, PixiesetPhoto } from "./models.js";
 
 const LOGGER_TAG = "[worker]";
 const logger = new Logger();
@@ -21,12 +21,6 @@ const stateStore = new StateStore();
  * Send x-goog-meta-* headers on upload. Must be true when backend signs URLs with metadata (metadata array in get-pixieset-upload-url).
  */
 const INCLUDE_OBJECT_METADATA = true;
-
-/**
- * If true, we do not send or request custom metadata for videos. This avoids GCS "metadata was edited during the operation"
- * errors that occur when the signed URL's metadata and the PUT request metadata don't match exactly.
- */
-const SKIP_VIDEO_METADATA = true;
 
 /** GCS custom metadata keys to include (x-goog-meta-<key>) */
 const PHOTO_METADATA_KEYS = [
@@ -62,88 +56,6 @@ function buildPhotoMetadataHeaders(photo: PixiesetPhoto): Record<string, string>
     headers[`x-goog-meta-${key}`] = str;
   }
   return headers;
-}
-
-/** GCS custom metadata keys for video (x-goog-meta-<key>) */
-const VIDEO_METADATA_KEYS = ["id", "provider_id", "name", "width", "height", "mux_status", "metadata"] as const;
-
-function buildVideoMetadataHeaders(video: PixiesetVideo): Record<string, string> {
-  const headers: Record<string, string> = {};
-  for (const key of VIDEO_METADATA_KEYS) {
-    const value = video[key as keyof PixiesetVideo];
-    if (value === undefined || value === null) continue;
-    headers[`x-goog-meta-${key}`] = String(value);
-  }
-  return headers;
-}
-
-/** Resolve a possibly relative URL against a base URL */
-function resolveUrl(baseUrl: string, relative: string): string {
-  if (relative.startsWith("http://") || relative.startsWith("https://")) return relative;
-  const base = new URL(baseUrl);
-  return new URL(relative, base.origin + base.pathname.replace(/\/[^/]*$/, "/")).href;
-}
-
-/** Build fetch options with optional Referer (used for HLS so Mux/CDN allows the request). */
-function hlsFetchOptions(referer?: string): RequestInit {
-  if (!referer) return {};
-  return { headers: { Referer: referer } };
-}
-
-/**
- * Parse HLS m3u8 text and return absolute segment URLs.
- * Handles master playlist (picks first variant) and media playlist.
- * When referer is set, variant playlist fetch uses it (to avoid 403 from Mux/CDN).
- */
-async function parseM3u8SegmentUrls(m3u8Url: string, text: string, referer?: string): Promise<string[]> {
-  const baseUrl = m3u8Url.replace(/\?.*$/, "").replace(/\/[^/]*$/, "/");
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
-  // Master playlist: has #EXT-X-STREAM-INF; next non-# line is variant URI
-  if (text.includes("#EXT-X-STREAM-INF")) {
-    let variantUri: string | null = null;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].startsWith("#EXT-X-STREAM-INF") && i + 1 < lines.length && !lines[i + 1].startsWith("#")) {
-        variantUri = lines[i + 1];
-        break;
-      }
-    }
-    if (!variantUri) {
-      throw new Error("Master playlist has no variant URI");
-    }
-    const variantUrl = resolveUrl(baseUrl + "dummy.m3u8", variantUri);
-    const res = await fetch(variantUrl, hlsFetchOptions(referer));
-    if (!res.ok) throw { status: res.status, statusText: res.statusText };
-    const variantText = await res.text();
-    return parseM3u8SegmentUrls(variantUrl, variantText, referer);
-  }
-
-  // Media playlist: #EXTINF followed by URI
-  const segments: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].startsWith("#EXTINF") && i + 1 < lines.length && !lines[i + 1].startsWith("#")) {
-      const uri = lines[i + 1];
-      segments.push(resolveUrl(baseUrl + "dummy.m3u8", uri));
-    }
-  }
-  return segments;
-}
-
-/** Fetch HLS stream from m3u8 URL and return as a single Blob (concatenated segments). referer: e.g. Pixieset gallery page URL to avoid 403. */
-async function fetchHlsAsBlob(m3u8Url: string, referer?: string): Promise<Blob> {
-  const res = await fetch(m3u8Url, hlsFetchOptions(referer));
-  if (!res.ok) throw { status: res.status, statusText: res.statusText };
-  const text = await res.text();
-  const segmentUrls = await parseM3u8SegmentUrls(m3u8Url, text, referer);
-  if (segmentUrls.length === 0) throw new Error("No segments in HLS playlist");
-  const parts: ArrayBuffer[] = [];
-  const opts = hlsFetchOptions(referer);
-  for (let i = 0; i < segmentUrls.length; i++) {
-    const segRes = await fetch(segmentUrls[i], opts);
-    if (!segRes.ok) throw { status: segRes.status, statusText: segRes.statusText };
-    parts.push(await segRes.arrayBuffer());
-  }
-  return new Blob(parts);
 }
 
 /**
@@ -333,87 +245,7 @@ async function processPhoto(
 }
 
 /**
- * Downloads HLS video from video_source and uploads to GCP using presigned URL.
- */
-async function processVideo(
-  video: PixiesetVideo,
-  collectionName: string,
-  username: string,
-  collectionId: number,
-  galleryId: number,
-  albumId: string | undefined,
-  uploadUrlResponse: GetUploadUrlResponse | undefined
-): Promise<{ success: boolean; failedImage?: { id: string; name: string; reason?: string } }> {
-  const videoId = String(video.id);
-  const videoName = video.name || `video-${video.id}.ts`;
-  const videoSource = video.video_source?.trim();
-  if (!videoSource) {
-    return { success: false, failedImage: { id: videoId, name: videoName, reason: "Missing video_source" } };
-  }
-
-  try {
-    let urlResponse = uploadUrlResponse;
-    if (!urlResponse) {
-      const metadataList = SKIP_VIDEO_METADATA ? [{}] : [buildVideoMetadataHeaders(video)];
-      const response = await getPixiesetUploadUrl(videoName, collectionName, username, albumId, metadataList);
-      urlResponse = Array.isArray(response) ? response[0] ?? { ok: false, error: "No response" } : response;
-    }
-    if (!urlResponse?.ok || urlResponse.skipped) {
-      if (urlResponse?.skipped) {
-        logger.info(`${LOGGER_TAG} Video ${videoName} already exists, skipped`);
-        return { success: true };
-      }
-      const errorMsg = urlResponse?.error ?? "Failed to get upload URL";
-      return { success: false, failedImage: { id: videoId, name: videoName, reason: errorMsg } };
-    }
-    if (!urlResponse.uploadUrl) {
-      return { success: false, failedImage: { id: videoId, name: videoName, reason: "No upload URL returned" } };
-    }
-
-    const uploadUrl = urlResponse.uploadUrl;
-    const objectPath = urlResponse.objectPath;
-
-    // Use Pixieset gallery page as Referer so Mux/CDN allows the request (otherwise 403)
-    const hlsReferer = `https://galleries.pixieset.com/collections/${collectionId}/sets/${galleryId}`;
-
-    await retryWithBackoff(
-      async () => {
-        const blob = await fetchHlsAsBlob(videoSource, hlsReferer);
-        const uploadHeaders: Record<string, string> = {
-          "Content-Type": "application/octet-stream"
-        };
-        if (INCLUDE_OBJECT_METADATA && !SKIP_VIDEO_METADATA) {
-          Object.assign(uploadHeaders, buildVideoMetadataHeaders(video));
-        }
-        const uploadResponse = await fetch(uploadUrl, {
-          method: "PUT",
-          headers: uploadHeaders,
-          body: blob
-        });
-        if (!uploadResponse.ok) {
-          throw { status: uploadResponse.status, statusText: uploadResponse.statusText };
-        }
-        return uploadResponse;
-      },
-      3,
-      1000,
-      shouldRetryHttpError
-    );
-
-    logger.info(`${LOGGER_TAG} Successfully uploaded ${videoName} to ${objectPath}`);
-    return { success: true };
-  } catch (error) {
-    const errorMsg =
-      error && typeof error === "object" && "status" in error && "statusText" in error
-        ? `HTTP ${(error as { status: number }).status}: ${(error as { statusText: string }).statusText}`
-        : error instanceof Error ? error.message : String(error);
-    logger.error(`${LOGGER_TAG} Error processing video ${videoName}`, error as Record<string, unknown>);
-    return { success: false, failedImage: { id: videoId, name: videoName, reason: errorMsg } };
-  }
-}
-
-/**
- * Processes all photos (and optionally videos) in a gallery
+ * Processes all photos in a gallery
  */
 async function processGallery(
   galleryId: number,
@@ -423,23 +255,21 @@ async function processGallery(
   onPhotoComplete?: (currentPhotoInCollection: number) => void,
   pauseState?: PauseState,
   albumId?: string,
-  concurrency: number = 1,
-  includeImages: boolean = true,
-  includeVideos: boolean = false
-): Promise<{ success: boolean; photoCount: number; videoCount: number; failedImages: Array<{ id: string; name: string }> }> {
-  const emptyResult = (): { success: boolean; photoCount: number; videoCount: number; failedImages: Array<{ id: string; name: string }> } =>
-    ({ success: true, photoCount: 0, videoCount: 0, failedImages: [] });
+  concurrency: number = 1
+): Promise<{ success: boolean; photoCount: number; failedImages: Array<{ id: string; name: string }> }> {
   try {
     // Check if we should skip this gallery based on pause state
     if (pauseState && pauseState.collectionId === collectionId && pauseState.galleryId !== undefined) {
       if (pauseState.galleryId > galleryId) {
-        return emptyResult();
+        // Gallery was already processed before pause, skip it
+        return { success: true, photoCount: 0, failedImages: [] };
       }
+      // If pauseState.galleryId < galleryId, we process normally (gallery after pause point)
+      // If pauseState.galleryId === galleryId, we resume from photoIndex (handled below)
     }
     
     const galleryDetail = await fetchGalleryDetail(galleryId, collectionId);
     const photos = galleryDetail?.data?.photos ?? [];
-    const videos = (galleryDetail?.data?.videos ?? []) as PixiesetVideo[];
     
     // Determine starting photo index if resuming
     let startPhotoIndex = 0;
@@ -448,16 +278,14 @@ async function processGallery(
       logger.info(`${LOGGER_TAG} Resuming gallery ${galleryId} from photo index ${startPhotoIndex}`);
     }
     
-    const photosToProcess = includeImages ? photos.slice(startPhotoIndex) : [];
-    let successCount = 0;
-    const failedImages: Array<{ id: string; name: string }> = [];
-    let processedCount = startPhotoIndex;
+    // Get photos to process
+    const photosToProcess = photos.slice(startPhotoIndex);
     
-    // --- Photos ---
+    // Batch fetch presigned URLs for all photos in this gallery
     const photoFilenames = photosToProcess.map(photo => (photo.name as string) ?? `photo-${photo.id}.jpg`);
     let presignedUrlMap: Map<string, GetUploadUrlResponse> = new Map();
     
-    if (includeImages && photoFilenames.length > 0) {
+    if (photoFilenames.length > 0) {
       try {
         const metadataList = photosToProcess.map(photo => buildPhotoMetadataHeaders(photo));
         logger.info(`${LOGGER_TAG} Batch fetching ${photoFilenames.length} presigned URLs for gallery ${galleryId}`);
@@ -481,6 +309,11 @@ async function processGallery(
         // Continue processing - processPhoto will handle missing URLs gracefully
       }
     }
+    
+    let successCount = 0;
+    const failedImages: Array<{ id: string; name: string }> = [];
+    // Start processedCount from startPhotoIndex to account for photos already processed
+    let processedCount = startPhotoIndex; // Track all photos processed (success + failure)
     
     // Process photos with concurrency
     const photoResults = await processWithConcurrency(
@@ -543,55 +376,21 @@ async function processGallery(
     }
     
     // Ensure all photos were processed before returning
-    let expectedProcessedCount = startPhotoIndex + photosToProcess.length;
+    // The processedCount should equal startPhotoIndex + photosToProcess.length
+    const expectedProcessedCount = startPhotoIndex + photosToProcess.length;
     if (processedCount < expectedProcessedCount && onPhotoComplete) {
+      // Update to final count if progress callback didn't fire for all items
       processedCount = expectedProcessedCount;
       onPhotoComplete(processedCount);
     }
     
-    // --- Videos ---
-    let videoCount = 0;
-    if (includeVideos && videos.length > 0) {
-      const videoFilenames = videos.map(v => v.name || `video-${v.id}.ts`);
-      const videoMetadataList = SKIP_VIDEO_METADATA
-        ? videos.map(() => ({}))
-        : videos.map(v => buildVideoMetadataHeaders(v));
-      let videoPresignedMap: Map<string, GetUploadUrlResponse> = new Map();
-      try {
-        const batchResponse = await getPixiesetUploadUrl(videoFilenames, collectionName, username, albumId, videoMetadataList);
-        if (Array.isArray(batchResponse)) {
-          for (let i = 0; i < videoFilenames.length && i < batchResponse.length; i++) {
-            videoPresignedMap.set(videoFilenames[i], batchResponse[i]);
-          }
-        } else if (batchResponse.ok && videoFilenames.length > 0) {
-          videoPresignedMap.set(videoFilenames[0], batchResponse);
-        }
-      } catch (error) {
-        logger.error(`${LOGGER_TAG} Failed to batch fetch presigned URLs for videos in gallery ${galleryId}`, error as Record<string, unknown>);
-      }
-      for (let i = 0; i < videos.length; i++) {
-        if (await stateStore.isPaused()) {
-          await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: processedCount + i });
-          break;
-        }
-        const video = videos[i];
-        const vName = video.name || `video-${video.id}.ts`;
-        const urlResponse = videoPresignedMap.get(vName);
-        const result = await processVideo(video, collectionName, username, collectionId, galleryId, albumId, urlResponse);
-        if (result.success) videoCount++;
-        else if (result.failedImage) failedImages.push(result.failedImage);
-        processedCount = startPhotoIndex + photosToProcess.length + (i + 1);
-        if (onPhotoComplete) onPhotoComplete(processedCount);
-      }
-    }
-    
-    return { success: true, photoCount: successCount, videoCount, failedImages };
+    return { success: true, photoCount: successCount, failedImages };
   } catch (error) {
     if ((error as Error).message === "unauthorized") {
-      throw error;
+      throw error; // Re-throw to handle at higher level
     }
     logger.error(`${LOGGER_TAG} gallery ${galleryId} failed`, error as Record<string, unknown>);
-    return { success: false, photoCount: 0, videoCount: 0, failedImages: [] };
+    return { success: false, photoCount: 0, failedImages: [] };
   }
 }
 
@@ -606,9 +405,7 @@ async function processCollection(
   galleries: Array<{ id: number; name: string; photo_count: number }>,
   onPhotoComplete?: (currentPhotoInCollection: number) => void,
   pauseState?: PauseState,
-  concurrency: number = 1,
-  includeImages: boolean = true,
-  includeVideos: boolean = false
+  concurrency: number = 1
 ): Promise<{ success: boolean; galleryCount: number; totalPhotos: number; successfulPhotos: number; failedImages: Array<{ id: string; name: string }>; paused?: boolean }> {
   // Create backend album
   let albumId: string | undefined;
@@ -664,23 +461,29 @@ async function processCollection(
       const photosBeforeThisGallery = processedPhotos;
       
       const result = await processGallery(
-        gallery.id,
-        collectionId,
-        collectionName,
+        gallery.id, 
+        collectionId, 
+        collectionName, 
         username,
-        (itemsInThisGallery) => {
-          processedPhotos = photosBeforeThisGallery + itemsInThisGallery;
-          if (onPhotoComplete) onPhotoComplete(processedPhotos);
+        (photosInThisGallery) => {
+          // photosInThisGallery is the count within this gallery (1-indexed, accounts for resume)
+          // Add it to the base count to get total photos processed in collection
+          processedPhotos = photosBeforeThisGallery + photosInThisGallery;
+          // Call the callback to update global progress
+          if (onPhotoComplete) {
+            onPhotoComplete(processedPhotos);
+          }
         },
-        pauseState,
-        albumId,
-        concurrency,
-        includeImages,
-        includeVideos
+        pauseState, // Pass pause state to processGallery
+        albumId, // Pass albumId to processGallery
+        concurrency // Pass concurrency to processGallery
       );
       
+      // After gallery completes, update processedPhotos to final count
+      // This ensures we have the correct count even if callback wasn't called for all photos
       if (result.success) {
-        processedPhotos = photosBeforeThisGallery + result.photoCount + result.videoCount;
+        // Gallery completed, so all photos in it are processed
+        processedPhotos = photosBeforeThisGallery + gallery.photo_count;
       }
       
       // Check if paused after gallery processing
@@ -690,7 +493,9 @@ async function processCollection(
       }
       if (result.success) {
         processedGalleries++;
-        successfulPhotos += result.photoCount + result.videoCount;
+        // Add successful photos from this gallery to the total
+        successfulPhotos += result.photoCount;
+        // Collect failed images from this gallery
         allFailedImages.push(...result.failedImages);
       }
       
@@ -755,38 +560,17 @@ async function getSelectedCollectionIds(
 async function loadCollectionPhotoCounts(
   selectedIds: number[]
 ): Promise<{ collectionPhotoCounts: Map<number, number>; totalPhotos: number }> {
-  return loadCollectionItemCounts(selectedIds, true, false);
-}
-
-/** Fetch item count (photos + optionally videos) per collection and total. When includeVideos, fetches each gallery detail. */
-async function loadCollectionItemCounts(
-  selectedIds: number[],
-  includeImages: boolean,
-  includeVideos: boolean
-): Promise<{ collectionPhotoCounts: Map<number, number>; totalPhotos: number }> {
   const collectionPhotoCounts = new Map<number, number>();
   let totalPhotos = 0;
   for (const id of selectedIds) {
     try {
       const detail = await fetchCollectionDetail(id);
       const galleries = detail?.data?.galleries ?? [];
-      if (!includeVideos) {
-        const photoCount = galleries.reduce((sum, g) => sum + g.photo_count, 0);
-        collectionPhotoCounts.set(id, photoCount);
-        totalPhotos += photoCount;
-      } else {
-        let itemCount = 0;
-        for (const gallery of galleries) {
-          const gd = await fetchGalleryDetail(gallery.id, id);
-          const photos = gd?.data?.photos ?? [];
-          const videos = gd?.data?.videos ?? [];
-          itemCount += (includeImages ? photos.length : 0) + (includeVideos ? videos.length : 0);
-        }
-        collectionPhotoCounts.set(id, itemCount);
-        totalPhotos += itemCount;
-      }
+      const photoCount = galleries.reduce((sum, g) => sum + g.photo_count, 0);
+      collectionPhotoCounts.set(id, photoCount);
+      totalPhotos += photoCount;
     } catch (error) {
-      logger.warn(`${LOGGER_TAG} Could not fetch item count for collection ${id}`, error as Record<string, unknown>);
+      logger.warn(`${LOGGER_TAG} Could not fetch photo count for collection ${id}`, error as Record<string, unknown>);
       collectionPhotoCounts.set(id, 0);
     }
   }
@@ -1045,11 +829,9 @@ async function runStartMigration(
     logger.info(`${LOGGER_TAG} Resuming from pause state: collection ${pauseState.collectionId}, gallery ${pauseState.galleryId}, photo ${pauseState.photoIndex}`);
   }
 
-  const includeImages = message.includeImages !== false;
-  const includeVideos = message.includeVideos === true;
   const allCollections = await stateStore.getCollections();
   const completedCount = allCollections.filter((c) => c.status === "completed").length;
-  const { collectionPhotoCounts, totalPhotos } = await loadCollectionItemCounts(selectedIds, includeImages, includeVideos);
+  const { collectionPhotoCounts, totalPhotos } = await loadCollectionPhotoCounts(selectedIds);
   let summary = getOrInitializeMigrationSummary(profile ?? null);
   let currentPhotoIndex = await computeResumePhotoIndex(selectedIds, collectionPhotoCounts, pauseState, allCollections);
   let currentCollectionIndex = completedCount;
@@ -1135,9 +917,7 @@ async function runStartMigration(
           });
         },
         pauseState,
-        concurrency,
-        includeImages,
-        includeVideos
+        concurrency
       );
       collectionProcessingComplete = true;
       const expectedFinalIndex = collectionStartPhotoIndex + totalPhotosInCollection;
@@ -1215,7 +995,7 @@ type BackgroundMessage =
   | { type: "bootstrap" }
   | { type: "fetchCollections"; page?: number }
   | { type: "getAllCollections" }
-  | { type: "startMigration"; selected?: number[]; all?: boolean; concurrency?: number; includeImages?: boolean; includeVideos?: boolean }
+  | { type: "startMigration"; selected?: number[]; all?: boolean; concurrency?: number }
   | { type: "pauseMigration" }
   | { type: "profileStatus" };
 

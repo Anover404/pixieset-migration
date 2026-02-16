@@ -41,16 +41,6 @@ export type GetUploadUrlResponse = {
 
 export type GetUploadUrlBatchResponse = GetUploadUrlResponse[];
 
-/** Turn backend error payload (string or object) into a single string for logging/UI */
-function stringifyBackendError(err: unknown): string {
-  if (err == null) return "Unknown error";
-  if (typeof err === "string") return err;
-  if (typeof err === "object" && err !== null && "message" in err && typeof (err as { message: unknown }).message === "string") {
-    return (err as { message: string }).message;
-  }
-  return JSON.stringify(err);
-}
-
 /**
  * Creates a Pixieset album in the backend
  * @param albumName - The collection name
@@ -160,7 +150,7 @@ export async function getPixiesetUploadUrl(
 
         if (!res.ok) {
           const errorData = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-          const errorMessage = stringifyBackendError(errorData.error ?? errorData.message ?? `HTTP ${res.status}: ${res.statusText}`);
+          const errorMessage = errorData.error as string ?? `HTTP ${res.status}: ${res.statusText}`;
           throw { status: res.status, statusText: res.statusText, errorMessage, errorData };
         }
 
@@ -180,22 +170,29 @@ export async function getPixiesetUploadUrl(
     
     return data as GetUploadUrlResponse;
   } catch (error) {
-    const errorMessage = (error && typeof error === "object" && "errorMessage" in error)
-      ? (error as { errorMessage: unknown }).errorMessage
+    const errorMessage = (error && typeof error === 'object' && 'errorMessage' in error)
+      ? (error as { errorMessage: string }).errorMessage
       : (error instanceof Error ? error.message : "Unknown error occurred");
-    const errorStr = typeof errorMessage === "string" ? errorMessage : stringifyBackendError(errorMessage);
-
-    logger.error(`${API_TAG} API call exception: ${endpoint} - ${errorStr}`, {
+    
+    logger.error(`${API_TAG} API call exception: ${endpoint} - ${errorMessage}`, {
       endpoint,
       url,
-      error: error instanceof Error ? error.stack : errorStr,
+      error: error instanceof Error ? error.stack : String(error),
       filename: isBatch ? `${filename.length} files` : filename,
       albumName
     });
-
+    
     if (isBatch) {
-      return filename.map(() => ({ ok: false, error: errorStr }));
+      // Return array of error responses for batch
+      return filename.map(() => ({
+        ok: false,
+        error: errorMessage
+      }));
     }
-    return { ok: false, error: errorStr };
+    
+    return {
+      ok: false,
+      error: errorMessage
+    };
   }
 }

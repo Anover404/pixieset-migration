@@ -20,20 +20,6 @@ export interface PixiesetPhoto {
   starred?: boolean;
 }
 
-/** Video object from Pixieset gallery API (subset used for upload + metadata) */
-export interface PixiesetVideo {
-  id: number;
-  name: string;
-  video_source: string;
-  width?: number;
-  height?: number;
-  provider_id?: number;
-  mux_status?: number;
-  metadata?: string; // JSON string from API
-  thumbnail_path?: string;
-  poster_path?: string;
-}
-
 export type MigrationStatus = "not_selected" | "pending" | "in_progress" | "completed" | "failed";
 export type ProfileMigrationStatus = "not_started" | "in_progress" | "completed";
 

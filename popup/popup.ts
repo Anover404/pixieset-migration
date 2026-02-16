@@ -99,8 +99,6 @@ const summaryDetailContent = document.getElementById("summaryDetailContent") as 
 const summaryModalClose = document.getElementById("summaryModalClose") as HTMLButtonElement | null;
 const summaryDownload = document.getElementById("summaryDownload") as HTMLButtonElement | null;
 const concurrencyFactorInput = document.getElementById("concurrencyFactor") as HTMLInputElement | null;
-const includeImagesCheckbox = document.getElementById("includeImages") as HTMLInputElement | null;
-const includeVideosCheckbox = document.getElementById("includeVideos") as HTMLInputElement | null;
 
 let modalCurrentPage = 1;
 let modalMeta: PaginationMeta = {};
@@ -848,12 +846,10 @@ const startMigration = async ({ all = false, selected = [] }: { all?: boolean; s
   // Get concurrency factor from UI (default to 3 if not set)
   const concurrencyFactor = concurrencyFactorInput ? parseInt(concurrencyFactorInput.value, 10) || 3 : 3;
   const concurrency = Math.max(1, Math.min(20, concurrencyFactor)); // Clamp between 1 and 20
-  const includeImages = includeImagesCheckbox?.checked !== false;
-  const includeVideos = includeVideosCheckbox?.checked === true;
   
   const payload = all 
-    ? { type: "startMigration", all: true, concurrency, includeImages, includeVideos } 
-    : { type: "startMigration", selected, concurrency, includeImages, includeVideos };
+    ? { type: "startMigration", all: true, concurrency } 
+    : { type: "startMigration", selected, concurrency };
   try {
     const response = (await chrome.runtime.sendMessage(payload)) as Record<string, unknown>;
     if (response?.success) {
