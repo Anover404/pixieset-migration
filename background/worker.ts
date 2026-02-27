@@ -17,29 +17,33 @@ const LOGGER_TAG = "[worker]";
 const logger = new Logger();
 const stateStore = new StateStore();
 
+/** Max number of presigned URLs to request per backend call (avoids 503 on large galleries). */
+const PRESIGNED_URL_BATCH_SIZE = 500;
+
 /**
  * Send x-goog-meta-* headers on upload. Must be true when backend signs URLs with metadata (metadata array in get-pixieset-upload-url).
  */
 const INCLUDE_OBJECT_METADATA = true;
 
-/** GCS custom metadata keys to include (x-goog-meta-<key>) */
+/** GCS custom metadata keys to include (x-goog-meta-<key>). Fewer keys = smaller presigned-URL request payload and less backend work. */
 const PHOTO_METADATA_KEYS = [
   "id",
   "gallery_id",
   "collection_id",
   "name",
   "mime_type",
-  "ext",
-  "size",
-  "width",
-  "height",
-  "rank",
-  "status",
+  // "size",
+  // "width",
+  // "height",
   "capture_date",
-  "watermark",
+  // Optional; comment back in if backend or downstream needs them:
+  // "ext",
+  // "rank",
+  // "status",
+  // "watermark",
   "mark_private_at",
   "visibility_status",
-  "starred"
+  "starred",
 ] as const;
 
 /**
@@ -217,7 +221,7 @@ async function processPhoto(
     );
 
     // Stream is consumed and closed, response objects will be GC'd after function returns
-    logger.info(`${LOGGER_TAG} Successfully uploaded ${photoName} to ${objectPath}`);
+    // Skip per-photo success log to reduce overhead (progress is reported via migrationProgress)
     
     // Check if paused after photo processing (in case pause was triggered during upload)
     if (await stateStore.isPaused()) {
@@ -280,110 +284,85 @@ async function processGallery(
     
     // Get photos to process
     const photosToProcess = photos.slice(startPhotoIndex);
-    
-    // Batch fetch presigned URLs for all photos in this gallery
-    const photoFilenames = photosToProcess.map(photo => (photo.name as string) ?? `photo-${photo.id}.jpg`);
-    let presignedUrlMap: Map<string, GetUploadUrlResponse> = new Map();
-    
-    if (photoFilenames.length > 0) {
+    let successCount = 0;
+    const failedImages: Array<{ id: string; name: string }> = [];
+    let processedCount = startPhotoIndex;
+
+    // Process in chunks: fetch one batch of presigned URLs, upload that batch, then next batch (keeps memory bounded)
+    const totalChunks = Math.ceil(photosToProcess.length / PRESIGNED_URL_BATCH_SIZE);
+    if (totalChunks > 1) {
+      logger.info(`${LOGGER_TAG} Processing gallery ${galleryId} in ${totalChunks} chunks (fetch + upload ${PRESIGNED_URL_BATCH_SIZE} at a time)`);
+    }
+
+    for (let offset = 0; offset < photosToProcess.length; offset += PRESIGNED_URL_BATCH_SIZE) {
+      const chunkPhotos = photosToProcess.slice(offset, offset + PRESIGNED_URL_BATCH_SIZE);
+      const chunkFilenames = chunkPhotos.map(photo => (photo.name as string) ?? `photo-${photo.id}.jpg`);
+      const chunkMetadata = chunkPhotos.map(photo => buildPhotoMetadataHeaders(photo));
+      const presignedUrlMap: Map<string, GetUploadUrlResponse> = new Map();
+
       try {
-        const metadataList = photosToProcess.map(photo => buildPhotoMetadataHeaders(photo));
-        logger.info(`${LOGGER_TAG} Batch fetching ${photoFilenames.length} presigned URLs for gallery ${galleryId}`);
-        const batchResponse = await getPixiesetUploadUrl(photoFilenames, collectionName, username, albumId, metadataList);
-        
+        const batchResponse = await getPixiesetUploadUrl(chunkFilenames, collectionName, username, albumId, chunkMetadata);
         if (Array.isArray(batchResponse)) {
-          // Create a map of filename -> presigned URL response
-          for (let i = 0; i < photoFilenames.length && i < batchResponse.length; i++) {
-            presignedUrlMap.set(photoFilenames[i], batchResponse[i]);
+          for (let i = 0; i < chunkFilenames.length && i < batchResponse.length; i++) {
+            if (batchResponse[i].ok) {
+              presignedUrlMap.set(chunkFilenames[i], batchResponse[i]);
+            }
           }
-          logger.info(`${LOGGER_TAG} Successfully fetched ${presignedUrlMap.size} presigned URLs for gallery ${galleryId}`);
         } else {
-          // Fallback: single response (shouldn't happen for batch, but handle gracefully)
-          logger.warn(`${LOGGER_TAG} Expected batch response but got single response for gallery ${galleryId}`);
           if (batchResponse.ok) {
-            presignedUrlMap.set(photoFilenames[0], batchResponse);
+            presignedUrlMap.set(chunkFilenames[0], batchResponse);
           }
         }
       } catch (error) {
-        logger.error(`${LOGGER_TAG} Failed to batch fetch presigned URLs for gallery ${galleryId}`, error as Record<string, unknown>);
-        // Continue processing - processPhoto will handle missing URLs gracefully
+        logger.error(`${LOGGER_TAG} Failed to fetch presigned URLs for gallery ${galleryId} chunk at offset ${offset}`, error as Record<string, unknown>);
+      }
+
+      const chunkStartIndex = startPhotoIndex + offset;
+      const photoResults = await processWithConcurrency(
+        chunkPhotos,
+        concurrency,
+        async (photo, batchIndex) => {
+          const actualIndex = chunkStartIndex + batchIndex;
+          if (await stateStore.isPaused()) {
+            await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: actualIndex });
+            return { success: false, failedImage: undefined };
+          }
+          const photoName = (photo.name as string) ?? `photo-${photo.id}.jpg`;
+          const uploadUrlResponse = presignedUrlMap.get(photoName);
+          const result = await processPhoto(photo, collectionName, username, collectionId, galleryId, actualIndex, albumId, uploadUrlResponse);
+          if (await stateStore.isPaused()) {
+            await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: actualIndex + 1 });
+          }
+          return result;
+        },
+        (completedInChunk) => {
+          processedCount = chunkStartIndex + completedInChunk;
+          if (onPhotoComplete) {
+            onPhotoComplete(processedCount);
+          }
+        }
+      );
+
+      for (let i = 0; i < photoResults.length; i++) {
+        const result = photoResults[i];
+        if (!result) continue;
+        if (result.success) {
+          successCount++;
+        } else if (result.failedImage) {
+          failedImages.push(result.failedImage);
+        }
+        if (await stateStore.isPaused()) {
+          await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: chunkStartIndex + i + 1 });
+          return { success: true, photoCount: successCount, failedImages };
+        }
       }
     }
-    
-    let successCount = 0;
-    const failedImages: Array<{ id: string; name: string }> = [];
-    // Start processedCount from startPhotoIndex to account for photos already processed
-    let processedCount = startPhotoIndex; // Track all photos processed (success + failure)
-    
-    // Process photos with concurrency
-    const photoResults = await processWithConcurrency(
-      photosToProcess,
-      concurrency,
-      async (photo, batchIndex) => {
-        const actualIndex = startPhotoIndex + batchIndex;
-        
-        // Check if paused before processing
-        if (await stateStore.isPaused()) {
-          await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: actualIndex });
-          return { success: false, failedImage: undefined };
-        }
-        
-        // Get the presigned URL response from the map
-        const photoName = (photo.name as string) ?? `photo-${photo.id}.jpg`;
-        const uploadUrlResponse = presignedUrlMap.get(photoName);
-        
-        const result = await processPhoto(photo, collectionName, username, collectionId, galleryId, actualIndex, albumId, uploadUrlResponse);
-        
-        // Check if paused after processing
-        if (await stateStore.isPaused()) {
-          await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: actualIndex + 1 });
-        }
-        
-        return result;
-      },
-      (completedCount) => {
-        // Update processed count
-        processedCount = startPhotoIndex + completedCount;
-        
-        // Call progress callback after each photo (even if failed, to track progress)
-        if (onPhotoComplete) {
-          onPhotoComplete(processedCount);
-        }
-      }
-    );
-    
-    // Process results and check for pause
-    // Ensure all results are processed (filter out undefined results from errors)
-    for (let i = 0; i < photoResults.length; i++) {
-      const result = photoResults[i];
-      if (!result) {
-        // Result is undefined (likely an error that was caught and rethrown)
-        // Count it as failed
-        continue;
-      }
-      if (result.success) {
-        successCount++;
-      } else if (result.failedImage) {
-        failedImages.push(result.failedImage);
-      }
-      
-      // Check if paused during processing
-      if (await stateStore.isPaused()) {
-        const actualIndex = startPhotoIndex + i;
-        await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: actualIndex + 1 });
-        break; // Exit if paused
-      }
-    }
-    
-    // Ensure all photos were processed before returning
-    // The processedCount should equal startPhotoIndex + photosToProcess.length
+
     const expectedProcessedCount = startPhotoIndex + photosToProcess.length;
     if (processedCount < expectedProcessedCount && onPhotoComplete) {
-      // Update to final count if progress callback didn't fire for all items
-      processedCount = expectedProcessedCount;
-      onPhotoComplete(processedCount);
+      onPhotoComplete(expectedProcessedCount);
     }
-    
+
     return { success: true, photoCount: successCount, failedImages };
   } catch (error) {
     if ((error as Error).message === "unauthorized") {
@@ -499,8 +478,8 @@ async function processCollection(
         allFailedImages.push(...result.failedImages);
       }
       
-      // Wait 0.5 seconds between gallery API calls
-      await sleep(500);
+      // Brief delay between galleries to avoid hammering Pixieset (reduced from 500ms for speed)
+      await sleep(100);
     } catch (error) {
       if ((error as Error).message === "unauthorized") {
         throw error; // Re-throw to handle at higher level
@@ -556,23 +535,28 @@ async function getSelectedCollectionIds(
   return selectedIds;
 }
 
-/** Fetch photo count per collection and total across selected collections */
+/** Fetch photo count per collection and total across selected collections (parallel fetches) */
 async function loadCollectionPhotoCounts(
   selectedIds: number[]
 ): Promise<{ collectionPhotoCounts: Map<number, number>; totalPhotos: number }> {
   const collectionPhotoCounts = new Map<number, number>();
+  const results = await Promise.all(
+    selectedIds.map(async (id) => {
+      try {
+        const detail = await fetchCollectionDetail(id);
+        const galleries = detail?.data?.galleries ?? [];
+        const photoCount = galleries.reduce((sum, g) => sum + g.photo_count, 0);
+        return { id, photoCount };
+      } catch (error) {
+        logger.warn(`${LOGGER_TAG} Could not fetch photo count for collection ${id}`, error as Record<string, unknown>);
+        return { id, photoCount: 0 };
+      }
+    })
+  );
   let totalPhotos = 0;
-  for (const id of selectedIds) {
-    try {
-      const detail = await fetchCollectionDetail(id);
-      const galleries = detail?.data?.galleries ?? [];
-      const photoCount = galleries.reduce((sum, g) => sum + g.photo_count, 0);
-      collectionPhotoCounts.set(id, photoCount);
-      totalPhotos += photoCount;
-    } catch (error) {
-      logger.warn(`${LOGGER_TAG} Could not fetch photo count for collection ${id}`, error as Record<string, unknown>);
-      collectionPhotoCounts.set(id, 0);
-    }
+  for (const { id, photoCount } of results) {
+    collectionPhotoCounts.set(id, photoCount);
+    totalPhotos += photoCount;
   }
   return { collectionPhotoCounts, totalPhotos };
 }
@@ -747,14 +731,23 @@ async function finalizeMigrationAfterLoop(
       return c?.status === "completed";
     });
     const finalProfile = await stateStore.loadAnyProfile();
-    const hasProgress =
+    const summaryHasCounts = Boolean(
       finalProfile?.summary &&
-      ((finalProfile.summary.totalCollections > 0) ||
-        (finalProfile.summary.totalGalleries > 0) ||
-        (finalProfile.summary.totalImages > 0));
+        ((finalProfile.summary.totalCollections > 0) ||
+          (finalProfile.summary.totalGalleries > 0) ||
+          (finalProfile.summary.totalImages > 0))
+    );
+    // When all selected collections are completed, we have progress (avoids "incomplete" when summary wasn't persisted yet)
+    const hasProgress = summaryHasCounts || allCompleted;
 
     if (allCompleted && hasProgress) {
-      const finalSummary = finalProfile?.summary;
+      const finalSummary = finalProfile?.summary ?? {
+        totalCollections: 0,
+        totalGalleries: 0,
+        totalImages: 0,
+        failedCollections: [],
+        failedImagesByCollection: []
+      };
       if (finalSummary?.startTime) {
         const now = Date.now();
         let totalPausedDuration = finalSummary.pausedDuration ?? 0;
@@ -772,7 +765,7 @@ async function finalizeMigrationAfterLoop(
       respondOnce({ success: true, processed: selectedIds, all: message.all ?? false });
     } else {
       logger.info(
-        `${LOGGER_TAG} Migration loop ended but conditions not met for completion. allCompleted: ${allCompleted}, hasProgress: ${hasProgress}`
+        `${LOGGER_TAG} Migration loop ended but conditions not met for completion. allCompleted: ${allCompleted}, hasProgress: ${hasProgress}, summaryHasCounts: ${summaryHasCounts}`
       );
       respondOnce({ success: false, reason: "incomplete" });
     }
@@ -833,6 +826,7 @@ async function runStartMigration(
   const completedCount = allCollections.filter((c) => c.status === "completed").length;
   const { collectionPhotoCounts, totalPhotos } = await loadCollectionPhotoCounts(selectedIds);
   let summary = getOrInitializeMigrationSummary(profile ?? null);
+  await stateStore.updateSummary(summary);
   let currentPhotoIndex = await computeResumePhotoIndex(selectedIds, collectionPhotoCounts, pauseState, allCollections);
   let currentCollectionIndex = completedCount;
   const isResuming = pauseState !== undefined && pauseState.collectionId !== undefined;
@@ -890,6 +884,10 @@ async function runStartMigration(
 
     let result: ProcessCollectionResult | null = null;
     let collectionProcessingComplete = false;
+    let lastProgressSentIndex = -1;
+    let lastProgressSentTime = 0;
+    const PROGRESS_THROTTLE_PHOTOS = 5;
+    const PROGRESS_THROTTLE_MS = 200;
     try {
       result = await processCollection(
         id,
@@ -901,20 +899,28 @@ async function runStartMigration(
           if (collectionProcessingComplete) return;
           const newGlobalIndex = collectionStartPhotoIndex + currentPhotoInCollection;
           if (newGlobalIndex > currentPhotoIndex) currentPhotoIndex = newGlobalIndex;
-          const percent = totalPhotos > 0 ? Math.min(100, Math.round((currentPhotoIndex / totalPhotos) * 100)) : 0;
-          chrome.runtime.sendMessage({
-            type: "migrationProgress",
-            collectionId: id,
-            collectionName,
-            status: "in_progress",
-            currentPhoto: currentPhotoInCollection,
-            totalPhotosInCollection,
-            currentPhotoIndex,
-            totalPhotos,
-            percent,
-            collectionIndex: currentCollectionIndex,
-            totalCollections: selectedIds.length
-          });
+          const now = Date.now();
+          const shouldSend =
+            currentPhotoIndex - lastProgressSentIndex >= PROGRESS_THROTTLE_PHOTOS ||
+            now - lastProgressSentTime >= PROGRESS_THROTTLE_MS;
+          if (shouldSend) {
+            lastProgressSentIndex = currentPhotoIndex;
+            lastProgressSentTime = now;
+            const percent = totalPhotos > 0 ? Math.min(100, Math.round((currentPhotoIndex / totalPhotos) * 100)) : 0;
+            chrome.runtime.sendMessage({
+              type: "migrationProgress",
+              collectionId: id,
+              collectionName,
+              status: "in_progress",
+              currentPhoto: currentPhotoInCollection,
+              totalPhotosInCollection,
+              currentPhotoIndex,
+              totalPhotos,
+              percent,
+              collectionIndex: currentCollectionIndex,
+              totalCollections: selectedIds.length
+            });
+          }
         },
         pauseState,
         concurrency
@@ -1115,13 +1121,13 @@ chrome.runtime.onMessage.addListener((message: BackgroundMessage, sender, sendRe
   if (message.type === "pauseMigration") {
     paused = true;
     logger.info("Popup requested migration pause");
-    (async () => {
-      // Get current pause state (will be set by the migration loop)
-      const pauseState = await stateStore.getPauseState();
-      await stateStore.setPaused(true, pauseState);
+    // Respond immediately so the message channel doesn't close (same issue as startMigration).
+    sendResponse({ paused: true });
+    // Set paused flag without passing pauseState so we don't overwrite with undefined.
+    // The migration loop will set the precise (collectionId, galleryId, photoIndex) when it sees isPaused().
+    void stateStore.setPaused(true).then(() => {
       chrome.runtime.sendMessage({ type: "migrationPaused", reason: "user" });
-      sendResponse({ paused });
-    })();
+    });
     return true;
   }
 
@@ -1243,9 +1249,17 @@ chrome.runtime.onMessage.addListener((message: BackgroundMessage, sender, sendRe
 
   if (message.type === "startMigration") {
     paused = false;
-    const concurrency = Math.max(1, Math.min(20, message.concurrency ?? 1));
-    logger.info(`${LOGGER_TAG} Starting migration with concurrency factor: ${concurrency}`);
-    runStartMigration(message, sendResponse, concurrency);
+    sendResponse({ success: true, started: true });
+    void (async () => {
+      const profile = await stateStore.loadAnyProfile();
+      const concurrency = Math.max(
+        1,
+        Math.min(20, message.concurrency ?? profile?.lastConcurrency ?? 3)
+      );
+      await stateStore.updateProfileConcurrency(concurrency);
+      logger.info(`${LOGGER_TAG} Starting migration with concurrency factor: ${concurrency}`);
+      runStartMigration(message, () => {}, concurrency);
+    })();
     return true;
   }
 

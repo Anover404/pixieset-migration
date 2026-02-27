@@ -6,6 +6,8 @@ const COLLECTION_STORE = "collections";
 
 export class StateStore {
   private dbPromise: Promise<IDBDatabase>;
+  private pausedCache: { value: boolean; at: number } | null = null;
+  private static readonly PAUSED_CACHE_MS = 50;
 
   constructor() {
     this.dbPromise = this.open();
@@ -164,6 +166,7 @@ export class StateStore {
       pauseState: paused && pauseState ? pauseState : (paused ? profile.pauseState : undefined),
       summary: updatedSummary
     });
+    this.pausedCache = { value: paused, at: Date.now() };
     await new Promise<void>((resolve, reject) => {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
@@ -191,8 +194,14 @@ export class StateStore {
   }
 
   async isPaused(): Promise<boolean> {
+    const now = Date.now();
+    if (this.pausedCache && now - this.pausedCache.at < StateStore.PAUSED_CACHE_MS) {
+      return this.pausedCache.value;
+    }
     const profile = await this.loadAnyProfile();
-    return profile?.paused ?? false;
+    const value = profile?.paused ?? false;
+    this.pausedCache = { value, at: now };
+    return value;
   }
 
   async getPendingCollections(): Promise<CollectionRecord[]> {
@@ -229,6 +238,22 @@ export class StateStore {
     const tx = db.transaction(PROFILE_STORE, "readwrite");
     const store = tx.objectStore(PROFILE_STORE);
     store.put({ ...profile, migrationStatus: status });
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  /** Persist concurrency so resume uses the same value when popup doesn't send it */
+  async updateProfileConcurrency(concurrency: number) {
+    const profile = await this.loadAnyProfile();
+    if (!profile) {
+      return;
+    }
+    const db = await this.dbPromise;
+    const tx = db.transaction(PROFILE_STORE, "readwrite");
+    const store = tx.objectStore(PROFILE_STORE);
+    store.put({ ...profile, lastConcurrency: concurrency });
     await new Promise<void>((resolve, reject) => {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);

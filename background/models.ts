@@ -65,6 +65,8 @@ export interface ProfileRecord {
   paused: boolean;
   summary?: MigrationSummary;
   pauseState?: PauseState; // Track where migration was paused
+  /** Concurrency used for migration; restored on resume when popup doesn't send it */
+  lastConcurrency?: number;
 }
 
 export interface CollectionRecord {

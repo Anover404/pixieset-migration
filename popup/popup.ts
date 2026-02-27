@@ -108,7 +108,7 @@ let isLoggedIn = false;
 let migrationActive = false;
 let totalCollections = 0;
 let processedCollections = 0;
-let lastMigrationOptions: { all?: boolean; selected?: number[] } = {};
+let lastMigrationOptions: { all?: boolean; selected?: number[]; concurrency?: number } = {};
 
 const updateStatus = (text: string) => {
   if (statusEl) {
@@ -838,17 +838,19 @@ const fetchModalPage = async (page = 1) => {
   }
 };
 
-const startMigration = async ({ all = false, selected = [] }: { all?: boolean; selected?: number[] }) => {
-  lastMigrationOptions = { all, selected };
+const startMigration = async ({
+  all = false,
+  selected = [],
+  concurrency: concurrencyOverride
+}: { all?: boolean; selected?: number[]; concurrency?: number } = {}) => {
+  const concurrencyFromUI = concurrencyFactorInput ? parseInt(concurrencyFactorInput.value, 10) || 3 : 3;
+  const concurrency = Math.max(1, Math.min(20, concurrencyOverride ?? lastMigrationOptions.concurrency ?? concurrencyFromUI));
+  lastMigrationOptions = { all, selected, concurrency };
   closeModal(); // Close modal immediately when migration starts
   enterMigrationView();
-  
-  // Get concurrency factor from UI (default to 3 if not set)
-  const concurrencyFactor = concurrencyFactorInput ? parseInt(concurrencyFactorInput.value, 10) || 3 : 3;
-  const concurrency = Math.max(1, Math.min(20, concurrencyFactor)); // Clamp between 1 and 20
-  
-  const payload = all 
-    ? { type: "startMigration", all: true, concurrency } 
+
+  const payload = all
+    ? { type: "startMigration", all: true, concurrency }
     : { type: "startMigration", selected, concurrency };
   try {
     const response = (await chrome.runtime.sendMessage(payload)) as Record<string, unknown>;
