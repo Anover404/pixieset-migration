@@ -8,7 +8,12 @@ import {
   DashboardResponse,
   BootstrapResponse
 } from "../services/pixieset.api.js";
-import { createPixiesetAlbum, getPixiesetUploadUrl, GetUploadUrlResponse } from "../services/backend.api.js";
+import {
+  createPixiesetAlbum,
+  getPixiesetUploadUrl,
+  getUserMetadataUploadUrl,
+  GetUploadUrlResponse
+} from "../services/backend.api.js";
 import { sleep } from "../utils/sleep.js";
 import { retryWithBackoff, shouldRetryHttpError } from "../utils/retry.js";
 import { PauseState, FailedImage, CollectionFailureInfo, MigrationSummary, PixiesetPhoto } from "./models.js";
@@ -49,8 +54,9 @@ const PHOTO_METADATA_KEYS = [
 /**
  * Builds x-goog-meta-* headers from a Pixieset photo for GCS object metadata.
  * Only includes defined values; numbers and booleans are stringified.
+ * Optionally includes userEmail as x-goog-meta-user-email and galleryName as x-goog-meta-gallery-name.
  */
-function buildPhotoMetadataHeaders(photo: PixiesetPhoto): Record<string, string> {
+function buildPhotoMetadataHeaders(photo: PixiesetPhoto, userEmail?: string, galleryName?: string): Record<string, string> {
   const headers: Record<string, string> = {};
   for (const key of PHOTO_METADATA_KEYS) {
     const value = photo[key as keyof PixiesetPhoto];
@@ -59,7 +65,24 @@ function buildPhotoMetadataHeaders(photo: PixiesetPhoto): Record<string, string>
       typeof value === "boolean" ? (value ? "true" : "false") : String(value);
     headers[`x-goog-meta-${key}`] = str;
   }
+  // Only add when non-empty so we never send headers the backend would sign but we'd omit (avoids 403)
+  const email = typeof userEmail === "string" ? userEmail.trim() : "";
+  if (email) headers["x-goog-meta-user_email"] = email;
+  const gallery = typeof galleryName === "string" ? galleryName.trim() : "";
+  if (gallery) headers["x-goog-meta-gallery_name"] = gallery;
+  console.log(`${LOGGER_TAG} buildPhotoMetadataHeaders: ${JSON.stringify(headers)}`);
   return headers;
+}
+
+/**
+ * Returns the upload filename for a photo: base name with _<mediaId> before the extension.
+ * e.g. "image.jpg" -> "image_123.jpg", "photo-5.jpg" -> "photo-5_5.jpg"
+ */
+function getUploadFilename(photo: PixiesetPhoto): string {
+  const base = (photo.name as string) ?? `photo-${photo.id}.jpg`;
+  const lastDot = base.lastIndexOf(".");
+  if (lastDot <= 0) return `${base}_${photo.id}`;
+  return base.slice(0, lastDot) + `_${photo.id}` + base.slice(lastDot);
 }
 
 /**
@@ -122,7 +145,9 @@ async function processPhoto(
   galleryId: number,
   photoIndex: number,
   albumId?: string,
-  uploadUrlResponse?: GetUploadUrlResponse
+  uploadUrlResponse?: GetUploadUrlResponse,
+  userEmail?: string,
+  galleryName?: string
 ): Promise<{ success: boolean; failedImage?: { id: string; name: string; reason?: string } }> {
   // Check if paused before processing
   if (await stateStore.isPaused()) {
@@ -131,8 +156,8 @@ async function processPhoto(
     return { success: false };
   }
   const photoId = String(photo.id);
-  const photoName = (photo.name as string) ?? `photo-${photo.id}.jpg`;
-  
+  const photoName = getUploadFilename(photo);
+
   const pathXxlarge = photo.path_xxlarge;
   if (!pathXxlarge) {
     return { success: false, failedImage: { id: photoId, name: photoName, reason: "Missing image path (path_xxlarge)" } };
@@ -145,7 +170,7 @@ async function processPhoto(
       urlResponse = uploadUrlResponse;
     } else {
       // Fallback: fetch individually if not provided (shouldn't happen in normal flow)
-      const metadataList = [buildPhotoMetadataHeaders(photo)];
+      const metadataList = [buildPhotoMetadataHeaders(photo, userEmail, galleryName)];
       const response = await getPixiesetUploadUrl(photoName, collectionName, username, albumId, metadataList);
       if (Array.isArray(response)) {
         // Shouldn't happen for single request, but handle it
@@ -201,7 +226,7 @@ async function processPhoto(
           "Content-Type": "application/octet-stream"
         };
         if (INCLUDE_OBJECT_METADATA) {
-          Object.assign(uploadHeaders, buildPhotoMetadataHeaders(photo));
+          Object.assign(uploadHeaders, buildPhotoMetadataHeaders(photo, userEmail, galleryName));
         }
         const uploadResponse = await fetch(uploadUrl, {
           method: "PUT",
@@ -259,7 +284,9 @@ async function processGallery(
   onPhotoComplete?: (currentPhotoInCollection: number) => void,
   pauseState?: PauseState,
   albumId?: string,
-  concurrency: number = 1
+  concurrency: number = 1,
+  userEmail?: string,
+  galleryName?: string
 ): Promise<{ success: boolean; photoCount: number; failedImages: Array<{ id: string; name: string }> }> {
   try {
     // Check if we should skip this gallery based on pause state
@@ -274,7 +301,8 @@ async function processGallery(
     
     const galleryDetail = await fetchGalleryDetail(galleryId, collectionId);
     const photos = galleryDetail?.data?.photos ?? [];
-    
+    const resolvedGalleryName = galleryName ?? galleryDetail?.data?.name ?? "";
+
     // Determine starting photo index if resuming
     let startPhotoIndex = 0;
     if (pauseState && pauseState.collectionId === collectionId && pauseState.galleryId === galleryId && pauseState.photoIndex !== undefined) {
@@ -296,8 +324,8 @@ async function processGallery(
 
     for (let offset = 0; offset < photosToProcess.length; offset += PRESIGNED_URL_BATCH_SIZE) {
       const chunkPhotos = photosToProcess.slice(offset, offset + PRESIGNED_URL_BATCH_SIZE);
-      const chunkFilenames = chunkPhotos.map(photo => (photo.name as string) ?? `photo-${photo.id}.jpg`);
-      const chunkMetadata = chunkPhotos.map(photo => buildPhotoMetadataHeaders(photo));
+      const chunkFilenames = chunkPhotos.map(photo => getUploadFilename(photo));
+      const chunkMetadata = chunkPhotos.map(photo => buildPhotoMetadataHeaders(photo, userEmail, resolvedGalleryName));
       const presignedUrlMap: Map<string, GetUploadUrlResponse> = new Map();
 
       try {
@@ -327,9 +355,9 @@ async function processGallery(
             await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: actualIndex });
             return { success: false, failedImage: undefined };
           }
-          const photoName = (photo.name as string) ?? `photo-${photo.id}.jpg`;
+          const photoName = getUploadFilename(photo);
           const uploadUrlResponse = presignedUrlMap.get(photoName);
-          const result = await processPhoto(photo, collectionName, username, collectionId, galleryId, actualIndex, albumId, uploadUrlResponse);
+          const result = await processPhoto(photo, collectionName, username, collectionId, galleryId, actualIndex, albumId, uploadUrlResponse, userEmail, resolvedGalleryName);
           if (await stateStore.isPaused()) {
             await stateStore.setPaused(true, { collectionId, galleryId, photoIndex: actualIndex + 1 });
           }
@@ -384,12 +412,13 @@ async function processCollection(
   galleries: Array<{ id: number; name: string; photo_count: number }>,
   onPhotoComplete?: (currentPhotoInCollection: number) => void,
   pauseState?: PauseState,
-  concurrency: number = 1
+  concurrency: number = 1,
+  userEmail?: string
 ): Promise<{ success: boolean; galleryCount: number; totalPhotos: number; successfulPhotos: number; failedImages: Array<{ id: string; name: string }>; paused?: boolean }> {
   // Create backend album
   let albumId: string | undefined;
   try {
-    const backendResponse = await createPixiesetAlbum(collectionName, collectionMetadata, username, collectionId.toString());
+    const backendResponse = await createPixiesetAlbum(collectionName, collectionMetadata, username, collectionId.toString(), userEmail);
     
     if (!backendResponse.success) {
       logger.error(`${LOGGER_TAG} backend API failed for collection ${collectionId}`, backendResponse);
@@ -455,7 +484,9 @@ async function processCollection(
         },
         pauseState, // Pass pause state to processGallery
         albumId, // Pass albumId to processGallery
-        concurrency // Pass concurrency to processGallery
+        concurrency, // Pass concurrency to processGallery
+        userEmail, // Pass userEmail for asset metadata
+        gallery.name // Pass gallery name for image metadata
       );
       
       // After gallery completes, update processedPhotos to final count
@@ -533,6 +564,35 @@ async function getSelectedCollectionIds(
       : (await stateStore.getPendingCollections()).map((c) => c.id);
   await stateStore.setPending(selectedIds, !message.all);
   return selectedIds;
+}
+
+/**
+ * Upload raw bootstrap payload to user_metadata.json (presigned URL). Marks profile as uploaded on success or backend skipped.
+ */
+async function uploadUserMetadataToBackend(
+  rawPayload: Record<string, unknown>,
+  domain: string
+): Promise<void> {
+  try {
+    const urlRes = await getUserMetadataUploadUrl(domain);
+    if (urlRes.ok && urlRes.uploadUrl && !urlRes.skipped) {
+      const putRes = await fetch(urlRes.uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(rawPayload)
+      });
+      if (!putRes.ok) {
+        throw new Error(`user_metadata.json upload failed: ${putRes.status} ${putRes.statusText}`);
+      }
+      logger.info(`${LOGGER_TAG} Uploaded user_metadata.json to ${urlRes.objectPath ?? "GCS"}`);
+    } else if (urlRes.skipped) {
+      logger.info(`${LOGGER_TAG} user_metadata.json already exists, skipped upload`);
+    }
+    await stateStore.setUserMetadataUploaded(true);
+  } catch (err) {
+    logger.warn(`${LOGGER_TAG} user_metadata.json upload failed`, err as Record<string, unknown>);
+    throw err;
+  }
 }
 
 /** Fetch photo count per collection and total across selected collections (parallel fetches) */
@@ -703,10 +763,11 @@ function updateSummaryAfterCollection(
         summary.failedImagesByCollection.push(failureInfo);
       }
       failureInfo.failedImageCount += failedImages.length;
-      if (failureInfo.failedImageCount < 3) {
+      if (failureInfo.failedImageCount <= 3) {
         failureInfo.failedImages.push(...failedImages);
       } else {
-        failureInfo.failedImages = [];
+        // Keep only the first as a sample (reason is usually the same when many fail)
+        failureInfo.failedImages = failedImages.length > 0 ? [failedImages[0]] : [];
       }
     }
   } else {
@@ -923,7 +984,8 @@ async function runStartMigration(
           }
         },
         pauseState,
-        concurrency
+        concurrency,
+        profile?.email
       );
       collectionProcessingComplete = true;
       const expectedFinalIndex = collectionStartPhotoIndex + totalPhotosInCollection;
@@ -1137,23 +1199,26 @@ chrome.runtime.onMessage.addListener((message: BackgroundMessage, sender, sendRe
       .then(async (response) => {
       if (response.loggedIn) {
         const previous = await stateStore.loadProfile(response.email);
+        const profilePayload = {
+          username: response.username,
+          email: response.email,
+          businessName: response.businessName,
+          paused: false
+        };
         if (!previous) {
           await stateStore.saveProfile({
-            username: response.username,
-            email: response.email,
-            businessName: response.businessName,
-            paused: false,
+            ...profilePayload,
             migrationStatus: "not_started"
           });
         } else if (previous.migrationStatus === "not_started") {
-          // keep existing status but update business info if changed
           await stateStore.saveProfile({
-            username: response.username,
-            email: response.email,
-            businessName: response.businessName,
-            paused: false,
+            ...profilePayload,
             migrationStatus: previous.migrationStatus
           });
+        }
+        // Upload user_metadata.json as soon as we have bootstrap data (don't wait for migration start)
+        if (response.raw && response.username && !previous?.userMetadataUploaded) {
+          void uploadUserMetadataToBackend(response.raw, response.username);
         }
         const existingCollections = await stateStore.getCollections();
         if (!existingCollections.length) {

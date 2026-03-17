@@ -57,6 +57,13 @@ type DisplayProfile = {
   businessName?: string;
 };
 
+const COLLECTION_NAME_MAX_LENGTH = 25;
+
+function truncateCollectionName(name: string, maxLen: number = COLLECTION_NAME_MAX_LENGTH): string {
+  if (name.length <= maxLen) return name;
+  return name.slice(0, maxLen) + "...";
+}
+
 const statusEl = document.getElementById("status") as HTMLParagraphElement | null;
 const userInfoEl = document.getElementById("userInfo") as HTMLParagraphElement | null;
 const countEl = document.getElementById("totalCount") as HTMLParagraphElement | null;
@@ -338,7 +345,9 @@ const populateSummaryDetail = async (summary: MigrationSummary) => {
       const item = document.createElement("div");
       item.className = "failed-collection-item";
       const collectionName = collectionMap.get(collectionId) ?? `Collection ${collectionId}`;
-      item.textContent = `${collectionName} (ID: ${collectionId})`;
+      const displayName = truncateCollectionName(collectionName);
+      item.textContent = `${displayName} (ID: ${collectionId})`;
+      item.title = collectionName;
       list.appendChild(item);
     });
     
@@ -365,7 +374,8 @@ const populateSummaryDetail = async (summary: MigrationSummary) => {
       
       const name = document.createElement("div");
       name.className = "collection-failure-name";
-      name.textContent = failureInfo.collectionName;
+      name.textContent = truncateCollectionName(failureInfo.collectionName);
+      name.title = failureInfo.collectionName;
       
       const count = document.createElement("div");
       count.className = "collection-failure-count";
@@ -375,11 +385,16 @@ const populateSummaryDetail = async (summary: MigrationSummary) => {
       header.appendChild(count);
       collectionInfo.appendChild(header);
       
-      // Show individual images if count < 3
-      if (failureInfo.failedImageCount < 3 && failureInfo.failedImages && failureInfo.failedImages.length > 0) {
+      // Show failed image details: all if ≤3, or one sample with reason if >3
+      if (failureInfo.failedImages && failureInfo.failedImages.length > 0) {
         const imageList = document.createElement("div");
         imageList.className = "failed-image-list";
-        
+        if (failureInfo.failedImageCount > 3) {
+          const sampleLabel = document.createElement("div");
+          sampleLabel.className = "failed-image-sample-label";
+          sampleLabel.textContent = "Sample failure (reason often same for all):";
+          imageList.appendChild(sampleLabel);
+        }
         failureInfo.failedImages.forEach((failedImage) => {
           const imageItem = document.createElement("div");
           imageItem.className = "failed-image-item";
@@ -432,9 +447,22 @@ const closeSummaryDetail = () => {
 const downloadSummary = () => {
   if (!currentSummary) return;
   
-  // Enhance summary with formatted time information
+  // Ensure failedImagesByCollection includes failure reasons in the download
+  const failedImagesByCollectionWithReasons = currentSummary.failedImagesByCollection?.map((c) => ({
+    collectionId: c.collectionId,
+    collectionName: c.collectionName,
+    failedImageCount: c.failedImageCount,
+    failedImages: (c.failedImages ?? []).map((img) => ({
+      id: img.id,
+      name: img.name,
+      ...(img.reason !== undefined && { reason: img.reason })
+    }))
+  }));
+
+  // Enhance summary with formatted time information and explicit failure reasons
   const enhancedSummary = {
     ...currentSummary,
+    failedImagesByCollection: failedImagesByCollectionWithReasons ?? currentSummary.failedImagesByCollection,
     timeInfo: {
       startTime: currentSummary.startTime ? new Date(currentSummary.startTime).toISOString() : undefined,
       endTime: currentSummary.endTime ? new Date(currentSummary.endTime).toISOString() : undefined,
@@ -444,7 +472,7 @@ const downloadSummary = () => {
       pausedDurationFormatted: formatElapsedTime(currentSummary.pausedDuration)
     }
   };
-  
+
   const dataStr = JSON.stringify(enhancedSummary, null, 2);
   const dataBlob = new Blob([dataStr], { type: "application/json" });
   const url = URL.createObjectURL(dataBlob);
@@ -675,11 +703,12 @@ const renderCollections = (collections: CollectionSummary[]) => {
     item.className = "collection-item";
     const thumbnailRaw = collection.coverPhotoThumbnail ?? collection.coverPhoto ?? "";
     const thumbnail = thumbnailRaw.startsWith("//") ? `https:${thumbnailRaw}` : thumbnailRaw;
+    const displayName = truncateCollectionName(collection.name);
     item.innerHTML = `
       <input type="checkbox" class="collection-check" data-id="${collection.id}">
-      <img class="collection-cover" src="${thumbnail}" alt="${collection.name}" />
+      <img class="collection-cover" src="${thumbnail}" alt="${displayName}" />
       <div class="collection-meta">
-        <p class="collection-title">${collection.name}</p>
+        <p class="collection-title" title="${collection.name}">${displayName}</p>
         <p class="collection-subtitle">${collection.photo_count ?? 0} photos</p>
       </div>
     `;
@@ -968,7 +997,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "migrationProgress") {
-    const collectionName = message.collectionName ?? message.name ?? `Collection ${message.collectionId}`;
+    const rawName = message.collectionName ?? message.name ?? `Collection ${message.collectionId}`;
+    const collectionName = truncateCollectionName(rawName);
     
     // Use percentage from message if available (photo-level progress)
     if (message.percent !== undefined) {

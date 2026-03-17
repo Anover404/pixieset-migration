@@ -87,6 +87,9 @@ body {
   min-height: 40px;
   transition: transform 200ms ease, opacity 200ms ease;
   transform: translateY(12px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   opacity: 0;
 }
 
@@ -234,6 +237,7 @@ button.ghost {
   border: none;
   font-size: 1.4rem;
   cursor: pointer;
+  outline: none;
 }
 
 .modal-status {
@@ -362,6 +366,9 @@ button.ghost {
   margin: 0;
   font-size: 0.95rem;
   color: #f8fafc;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .collection-subtitle {
@@ -525,24 +532,36 @@ button.secondary {
   align-items: center;
 }
 
-.summary-download {
-  background: rgba(99, 102, 241, 0.2);
-  border: 1px solid rgba(99, 102, 241, 0.3);
-  color: #a5b4fc;
+/* Unified icon buttons in summary modal header */
+.modal-header-actions .summary-download,
+.modal-header-actions .modal-close {
   width: 32px;
   height: 32px;
   border-radius: 50%;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(148, 163, 184, 0.12);
+  color: #e2e8f0;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.2s;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+  outline: none;
 }
 
-.summary-download:hover {
-  background: rgba(99, 102, 241, 0.3);
-  color: #c7d2fe;
-  border-color: rgba(99, 102, 241, 0.5);
+.modal-header-actions .summary-download:hover,
+.modal-header-actions .modal-close:hover {
+  background: rgba(148, 163, 184, 0.2);
+  border-color: rgba(148, 163, 184, 0.35);
+}
+
+.modal-header-actions .summary-download:focus-visible,
+.modal-header-actions .modal-close:focus-visible {
+  box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.3);
+}
+
+.modal-header-actions .summary-download svg {
+  flex-shrink: 0;
 }
 
 .summary-detail-body {
@@ -589,6 +608,9 @@ button.secondary {
 
 .failed-collection-item {
   background: rgba(239, 68, 68, 0.15);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .collection-failure-info {
@@ -610,11 +632,20 @@ button.secondary {
 .collection-failure-name {
   font-weight: 600;
   color: #e2e8f0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .collection-failure-count {
   color: #fca5a5;
   font-size: 0.9rem;
+}
+
+.failed-image-sample-label {
+  font-size: 0.75rem;
+  color: #94a3b8;
+  margin-bottom: 4px;
 }
 
 .failed-image-list {

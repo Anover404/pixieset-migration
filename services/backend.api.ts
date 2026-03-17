@@ -13,6 +13,7 @@ export type CreateAlbumRequest = {
   fullMetadata: Record<string, unknown>;
   domain: string;
   albumId?: string;
+  userEmail?: string;
 };
 
 export type CreateAlbumResponse = {
@@ -42,17 +43,65 @@ export type GetUploadUrlResponse = {
 export type GetUploadUrlBatchResponse = GetUploadUrlResponse[];
 
 /**
+ * Gets a presigned URL for uploading user_metadata.json (bootstrap dump) under domain.
+ * Used once per user at migration start.
+ */
+export async function getUserMetadataUploadUrl(domain: string): Promise<GetUploadUrlResponse> {
+  const endpoint = "/api/get-user-metadata-upload-url";
+  const url = `${BACKEND_BASE_URL}${endpoint}`;
+  try {
+    const response = await retryWithBackoff(
+      async () => {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            authorization: AUTH_TOKEN
+          },
+          body: JSON.stringify({ domain })
+        });
+        if (!res.ok) {
+          const errorData = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+          const errorMessage = (errorData.error as string) ?? `HTTP ${res.status}: ${res.statusText}`;
+          throw { status: res.status, statusText: res.statusText, errorMessage, errorData };
+        }
+        return res;
+      },
+      3,
+      1000,
+      shouldRetryHttpError
+    );
+    return (await response.json()) as GetUploadUrlResponse;
+  } catch (error) {
+    const errorMessage =
+      error && typeof error === "object" && "errorMessage" in error
+        ? (error as { errorMessage: string }).errorMessage
+        : (error instanceof Error ? error.message : "Unknown error");
+    logger.error(`${API_TAG} API call exception: ${endpoint} - ${errorMessage}`, {
+      endpoint,
+      url,
+      error: error instanceof Error ? error.stack : String(error)
+    });
+    return { ok: false, error: errorMessage };
+  }
+}
+
+/**
  * Creates a Pixieset album in the backend
  * @param albumName - The collection name
  * @param fullMetadata - The complete JSON response from fetchCollectionDetail
  * @param domain - The username from the bootstrap/profile
+ * @param albumId - Optional collection ID
+ * @param userEmail - Optional user email from the profile
  * @returns Response from the backend API
  */
 export async function createPixiesetAlbum(
   albumName: string,
   fullMetadata: Record<string, unknown>,
   domain: string,
-  albumId?: string
+  albumId?: string,
+  userEmail?: string
 ): Promise<CreateAlbumResponse> {
   const endpoint = "/api/create-pixieset-album";
   const url = `${BACKEND_BASE_URL}${endpoint}`;
@@ -71,7 +120,8 @@ export async function createPixiesetAlbum(
             albumName,
             fullMetadata,
             domain,
-            ...(albumId && { albumId })
+            ...(albumId && { albumId }),
+            ...(userEmail && { userEmail })
           })
         });
 

@@ -43,6 +43,8 @@ type BootstrapSuccess = {
   email: string;
   businessName?: string;
   status: number;
+  /** Full API response for uploading to user_metadata.json (avoids a second bootstrap call at migration start) */
+  raw?: Record<string, unknown>;
 };
 
 type BootstrapFailure = {
@@ -117,14 +119,15 @@ export async function fetchBootstrap(): Promise<BootstrapResponse> {
     const payload = (await response.json()) as Record<string, unknown>;
     const data = payload?.data as Record<string, unknown> | undefined;
     const user = data?.user as Record<string, unknown> | undefined;
-    const profile = data?.profile as Record<string, unknown> | undefined;
+    const profileData = data?.profile as Record<string, unknown> | undefined;
 
     return {
       loggedIn: true,
       status: response.status,
       username: (user?.username as string) ?? "user",
       email: (user?.email as string) ?? "",
-      businessName: profile?.business_name as string | undefined
+      businessName: profileData?.business_name as string | undefined,
+      raw: payload
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";

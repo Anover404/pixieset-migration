@@ -260,6 +260,22 @@ export class StateStore {
     });
   }
 
+  /** Mark that user_metadata.json has been uploaded for this user (so we don't re-upload on next migration). */
+  async setUserMetadataUploaded(uploaded: boolean) {
+    const profile = await this.loadAnyProfile();
+    if (!profile) {
+      return;
+    }
+    const db = await this.dbPromise;
+    const tx = db.transaction(PROFILE_STORE, "readwrite");
+    const store = tx.objectStore(PROFILE_STORE);
+    store.put({ ...profile, userMetadataUploaded: uploaded });
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async updateSummary(summary: MigrationSummary) {
     const profile = await this.loadAnyProfile();
     if (!profile) {

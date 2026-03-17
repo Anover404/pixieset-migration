@@ -67,6 +67,8 @@ export interface ProfileRecord {
   pauseState?: PauseState; // Track where migration was paused
   /** Concurrency used for migration; restored on resume when popup doesn't send it */
   lastConcurrency?: number;
+  /** Set when bootstrap dump (user_metadata.json) has been uploaded for this user so we don't re-upload */
+  userMetadataUploaded?: boolean;
 }
 
 export interface CollectionRecord {
