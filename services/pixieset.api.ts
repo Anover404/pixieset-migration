@@ -1,5 +1,5 @@
 import { Logger } from "../background/logger.js";
-import { retryWithBackoff, shouldRetryHttpError } from "../utils/retry.js";
+import { isAbortError, retryWithBackoff, shouldRetryHttpError } from "../utils/retry.js";
 
 const DASHBOARD_API = "https://galleries.pixieset.com/api/v1/dashboard_listings";
 const BOOTSTRAP_API = "https://galleries.pixieset.com/api/v1/data/bootstrap";
@@ -67,6 +67,9 @@ const commonHeaders = {
  * Does not retry 401/403 (authentication errors)
  */
 function shouldRetryPixiesetError(error: unknown): boolean {
+  if (isAbortError(error)) {
+    return false;
+  }
   // Don't retry authentication errors
   if (error && typeof error === 'object' && 'status' in error) {
     const status = (error as { status: number }).status;
@@ -198,7 +201,7 @@ export type CollectionDetail = {
   };
 };
 
-export async function fetchCollectionDetail(collectionId: number): Promise<CollectionDetail> {
+export async function fetchCollectionDetail(collectionId: number, signal?: AbortSignal): Promise<CollectionDetail> {
   const endpoint = `/api/v1/collections/${collectionId}/before_show`;
   const url = `https://galleries.pixieset.com${endpoint}`;
   const headers = {
@@ -217,7 +220,7 @@ export async function fetchCollectionDetail(collectionId: number): Promise<Colle
   try {
     const response = await retryWithBackoff(
       async () => {
-        const res = await fetch(url, { credentials: "include", headers });
+        const res = await fetch(url, { credentials: "include", headers, signal });
         if (res.status === 401 || res.status === 403) {
           throw Object.assign(new Error("unauthorized"), { status: res.status, noRetry: true });
         }
@@ -238,7 +241,10 @@ export async function fetchCollectionDetail(collectionId: number): Promise<Colle
     if (error instanceof Error && error.message === "unauthorized") {
       throw error;
     }
-    
+    if (isAbortError(error)) {
+      throw error;
+    }
+
     const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
     logger.error(`${API_TAG} API call exception: ${endpoint} - ${errorMessage}`, {
       endpoint,
@@ -268,7 +274,11 @@ export type GalleryDetail = {
   };
 };
 
-export async function fetchGalleryDetail(galleryId: number, collectionId: number): Promise<GalleryDetail> {
+export async function fetchGalleryDetail(
+  galleryId: number,
+  collectionId: number,
+  signal?: AbortSignal
+): Promise<GalleryDetail> {
   const endpoint = `/api/v1/galleries/${galleryId}`;
   const url = `https://galleries.pixieset.com${endpoint}?expand=photos.starred%2Cvideos`;
   const headers = {
@@ -287,7 +297,7 @@ export async function fetchGalleryDetail(galleryId: number, collectionId: number
   try {
     const response = await retryWithBackoff(
       async () => {
-        const res = await fetch(url, { credentials: "include", headers });
+        const res = await fetch(url, { credentials: "include", headers, signal });
         if (res.status === 401 || res.status === 403) {
           throw Object.assign(new Error("unauthorized"), { status: res.status, noRetry: true });
         }
@@ -308,7 +318,10 @@ export async function fetchGalleryDetail(galleryId: number, collectionId: number
     if (error instanceof Error && error.message === "unauthorized") {
       throw error;
     }
-    
+    if (isAbortError(error)) {
+      throw error;
+    }
+
     const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
     logger.error(`${API_TAG} API call exception: ${endpoint} - ${errorMessage}`, {
       endpoint,

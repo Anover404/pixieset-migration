@@ -1,5 +1,5 @@
 import { Logger } from "../background/logger.js";
-import { retryWithBackoff, shouldRetryHttpError } from "../utils/retry.js";
+import { isAbortError, retryWithBackoff, shouldRetryHttpError } from "../utils/retry.js";
 
 const BACKEND_BASE_URL = "https://pixie-set-backend-pxbb63zhgq-uc.a.run.app";
 
@@ -101,7 +101,8 @@ export async function createPixiesetAlbum(
   fullMetadata: Record<string, unknown>,
   domain: string,
   albumId?: string,
-  userEmail?: string
+  userEmail?: string,
+  signal?: AbortSignal
 ): Promise<CreateAlbumResponse> {
   const endpoint = "/api/create-pixieset-album";
   const url = `${BACKEND_BASE_URL}${endpoint}`;
@@ -116,6 +117,7 @@ export async function createPixiesetAlbum(
             Accept: "application/json",
             authorization: AUTH_TOKEN
           },
+          signal,
           body: JSON.stringify({
             albumName,
             fullMetadata,
@@ -144,6 +146,9 @@ export async function createPixiesetAlbum(
       success: data.success ?? true
     };
   } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
     const errorMessage = (error && typeof error === 'object' && 'errorMessage' in error)
       ? (error as { errorMessage: string }).errorMessage
       : (error instanceof Error ? error.message : "Unknown error occurred");
@@ -173,7 +178,8 @@ export async function getPixiesetUploadUrl(
   albumName: string,
   domain: string,
   albumId?: string,
-  metadata?: Array<Record<string, string>>
+  metadata?: Array<Record<string, string>>,
+  signal?: AbortSignal
 ): Promise<GetUploadUrlResponse | GetUploadUrlBatchResponse> {
   const endpoint = "/api/get-pixieset-upload-url";
   const url = `${BACKEND_BASE_URL}${endpoint}`;
@@ -189,6 +195,7 @@ export async function getPixiesetUploadUrl(
             Accept: "application/json",
             authorization: AUTH_TOKEN
           },
+          signal,
           body: JSON.stringify({
             filename,
             albumName,
@@ -220,6 +227,9 @@ export async function getPixiesetUploadUrl(
     
     return data as GetUploadUrlResponse;
   } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
     const errorMessage = (error && typeof error === 'object' && 'errorMessage' in error)
       ? (error as { errorMessage: string }).errorMessage
       : (error instanceof Error ? error.message : "Unknown error occurred");

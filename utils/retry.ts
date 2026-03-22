@@ -1,5 +1,16 @@
 import { sleep } from "./sleep.js";
 
+/** True when fetch (or another API) was cancelled via AbortController. */
+export function isAbortError(error: unknown): boolean {
+  if (error instanceof Error && error.name === "AbortError") {
+    return true;
+  }
+  if (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "AbortError") {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Retries a function with exponential backoff
  * @param fn - The async function to retry
@@ -21,7 +32,11 @@ export async function retryWithBackoff<T>(
       return await fn();
     } catch (error) {
       lastError = error;
-      
+
+      if (isAbortError(error)) {
+        throw error;
+      }
+
       // Check if we should retry this error
       if (shouldRetry && !shouldRetry(error)) {
         throw error;
@@ -46,6 +61,9 @@ export async function retryWithBackoff<T>(
  * Does not retry on: 400-499 (client errors except 429)
  */
 export function shouldRetryHttpError(error: unknown): boolean {
+  if (isAbortError(error)) {
+    return false;
+  }
   // Network errors (fetch failures)
   if (error instanceof TypeError && error.message.includes('fetch')) {
     return true;

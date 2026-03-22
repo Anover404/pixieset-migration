@@ -160,10 +160,16 @@ export class StateStore {
       }
     }
     
-    store.put({ 
-      ...profile, 
+    // When unpausing, keep existing pauseState until the worker clears it (resume position).
+    // When pausing, merge explicit pauseState or keep prior snapshot.
+    const nextPauseState = paused
+      ? pauseState ?? profile.pauseState
+      : profile.pauseState;
+
+    store.put({
+      ...profile,
       paused,
-      pauseState: paused && pauseState ? pauseState : (paused ? profile.pauseState : undefined),
+      pauseState: nextPauseState,
       summary: updatedSummary
     });
     this.pausedCache = { value: paused, at: Date.now() };
@@ -245,6 +251,22 @@ export class StateStore {
   }
 
   /** Persist concurrency so resume uses the same value when popup doesn't send it */
+  /** Persist selected collection IDs for the current migration (photo % and x/y are scoped to this list). */
+  async updateMigrationSelection(ids: number[] | undefined) {
+    const profile = await this.loadAnyProfile();
+    if (!profile) {
+      return;
+    }
+    const db = await this.dbPromise;
+    const tx = db.transaction(PROFILE_STORE, "readwrite");
+    const store = tx.objectStore(PROFILE_STORE);
+    store.put({ ...profile, migrationSelectedIds: ids });
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
   async updateProfileConcurrency(concurrency: number) {
     const profile = await this.loadAnyProfile();
     if (!profile) {
@@ -329,6 +351,8 @@ export class StateStore {
       ...profile,
       migrationStatus: "not_started",
       paused: false,
+      pauseState: undefined,
+      migrationSelectedIds: undefined,
       summary: { totalCollections: 0, totalGalleries: 0, totalImages: 0, failedCollections: [], failedImagesByCollection: [] }
     });
     await new Promise<void>((resolve, reject) => {

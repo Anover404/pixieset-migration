@@ -510,6 +510,8 @@ const refreshProfileStatus = async () => {
     const response = (await chrome.runtime.sendMessage({ type: "profileStatus" })) as {
       loggedIn: boolean;
       profile?: ProfileRecord & { paused?: boolean };
+      /** Account-wide collection count (header) */
+      accountCollectionTotal?: number;
       total?: number;
       completed?: number;
       currentPhotoIndex?: number;
@@ -524,7 +526,7 @@ const refreshProfileStatus = async () => {
     }
 
     updateUserInfo(response.profile);
-    updateCount(response.total);
+    updateCount(response.accountCollectionTotal ?? response.total);
     
     // Update status with migration status
     if (response.profile.migrationStatus === "completed") {
@@ -542,40 +544,52 @@ const refreshProfileStatus = async () => {
     if (response.profile.migrationStatus === "in_progress") {
       totalCollections = response.total ?? 0;
       processedCollections = response.completed ?? 0;
-      
-      // Use photo-level percentage if available (more accurate)
-      if (response.percent !== undefined && response.totalPhotos !== undefined && response.totalPhotos > 0) {
+      const paused = response.profile.paused ?? false;
+
+      if (paused) {
+        if (loaderPercent) {
+          loaderPercent.textContent =
+            totalCollections > 0
+              ? `${processedCollections}/${totalCollections} collections`
+              : "0 collections";
+        }
+      } else if (response.percent !== undefined && response.totalPhotos !== undefined && response.totalPhotos > 0) {
         if (loaderPercent) {
           loaderPercent.textContent = `${response.percent}%`;
         }
-      } else {
-        // Fallback to collection-level percentage
+      } else if (response.percent !== undefined) {
         if (loaderPercent) {
-          loaderPercent.textContent = totalCollections
-            ? `${Math.round((processedCollections / totalCollections) * 100)}%`
-            : "0%";
+          loaderPercent.textContent = `${response.percent}%`;
         }
+      } else if (loaderPercent) {
+        loaderPercent.textContent = totalCollections
+          ? `${Math.round((processedCollections / totalCollections) * 100)}%`
+          : "0%";
       }
-      const paused = response.profile.paused ?? false;
+
       showView("progress");
       setActionMode(true);
       showLoader();
       applyLoaderPauseState(paused);
       updatePauseResumeControls(paused);
       migrationActive = !paused;
-      // Show appropriate status and progress text
       if (paused) {
         updateStatus("Migration paused");
-        updateProgress("Migration paused - click Resume to continue");
+        updateProgress(
+          totalCollections > 0
+            ? `Paused — ${processedCollections}/${totalCollections} collections done`
+            : "Migration paused — click Resume to continue"
+        );
       } else {
         updateStatus("Migration in progress...");
-        // Only show "Migration in progress..." if we have actual progress
-        if (response.percent !== undefined && response.percent > 0) {
-          updateProgress(`Migration in progress... ${response.percent}%`);
-        } else if (processedCollections > 0) {
-          updateProgress(`Migration in progress... ${processedCollections}/${totalCollections} collections`);
+        if (response.percent !== undefined && response.percent > 0 && response.totalPhotos && response.totalPhotos > 0) {
+          updateProgress(`Migration in progress… ${response.percent}% (${processedCollections}/${totalCollections} collections done)`);
+        } else if (response.percent !== undefined && response.percent > 0) {
+          updateProgress(`Migration in progress… ${response.percent}%`);
+        } else if (processedCollections > 0 && totalCollections > 0) {
+          updateProgress(`Migration in progress… ${processedCollections}/${totalCollections} collections`);
         } else {
-          updateProgress("Migration in progress...");
+          updateProgress("Migration in progress…");
         }
       }
     } else {
@@ -869,22 +883,29 @@ const fetchModalPage = async (page = 1) => {
 
 const startMigration = async ({
   all = false,
-  selected = [],
+  selected,
   concurrency: concurrencyOverride
 }: { all?: boolean; selected?: number[]; concurrency?: number } = {}) => {
   const concurrencyFromUI = concurrencyFactorInput ? parseInt(concurrencyFactorInput.value, 10) || 3 : 3;
   const concurrency = Math.max(1, Math.min(20, concurrencyOverride ?? lastMigrationOptions.concurrency ?? concurrencyFromUI));
-  lastMigrationOptions = { all, selected, concurrency };
+  const selectedIdsList = selected ?? [];
+  // Avoid storing `selected: []` with migrate-all — resume would otherwise look like "selected migration with no IDs"
+  // and the worker would fall back to pending-only collections.
+  lastMigrationOptions = all
+    ? { all: true, concurrency }
+    : { all: false, selected: selectedIdsList, concurrency };
   closeModal(); // Close modal immediately when migration starts
   enterMigrationView();
 
   const payload = all
     ? { type: "startMigration", all: true, concurrency }
-    : { type: "startMigration", selected, concurrency };
+    : { type: "startMigration", selected: selectedIdsList, concurrency };
   try {
     const response = (await chrome.runtime.sendMessage(payload)) as Record<string, unknown>;
     if (response?.success) {
-      updateStatus(all ? "Migrating all collections" : `Migrating ${selected.length} selected collection(s)`);
+      updateStatus(
+        all ? "Migrating all collections" : `Migrating ${selectedIdsList.length} selected collection(s)`
+      );
     } else {
       updateStatus("Unable to start migration");
     }
@@ -1040,9 +1061,21 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 
   if (message.type === "migrationPaused") {
-    updateStatus("Migration paused due to authentication");
-    updateProgress("");
-    toggleLoginButton(true);
+    const authPause = message.reason === "unauthorized" || message.reason === "collectionsFetchFailed";
+    updateStatus(authPause ? "Migration paused — sign in to continue" : "Migration paused");
+    const c = message.completedSelected;
+    const t = message.totalSelected;
+    if (loaderPercent && typeof c === "number" && typeof t === "number" && t > 0) {
+      loaderPercent.textContent = `${c}/${t} collections`;
+      processedCollections = c;
+      totalCollections = t;
+    }
+    updateProgress(
+      typeof c === "number" && typeof t === "number" && t > 0
+        ? `Paused — ${c}/${t} collections done`
+        : "Paused — click Resume to continue"
+    );
+    toggleLoginButton(authPause);
     setActionMode(true);
     showView("progress");
     showLoader();
